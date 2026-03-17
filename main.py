@@ -1,5 +1,6 @@
 # 加载环境变量
 from dotenv import load_dotenv, find_dotenv
+
 _ = load_dotenv(find_dotenv())
 
 from Agent.ReAct import ReActAgent
@@ -11,8 +12,8 @@ import os
 
 
 def launch_agent(agent: ReActAgent):
-    human_icon = "\U0001F468"
-    ai_icon = "\U0001F916"
+    human_icon = "\U0001f468"
+    ai_icon = "\U0001f916"
     chat_history = ChatMessageHistory()
 
     while True:
@@ -26,7 +27,7 @@ def launch_agent(agent: ReActAgent):
 def main():
 
     # 语言模型
-    llm = ChatModelFactory.get_model("gpt-4o")
+    llm = ChatModelFactory.get_model()
 
     # 自定义工具集
     tools = [
@@ -37,10 +38,8 @@ def main():
         directory_inspection_tool,
         finish_placeholder,
         ExcelAnalyser(
-            llm=llm,
-            prompt_file="./prompts/tools/excel_analyser.txt",
-            verbose=True
-        ).as_tool()
+            llm=llm, prompt_file="./prompts/tools/excel_analyser.txt", verbose=True
+        ).as_tool(),
     ]
 
     # 定义智能体

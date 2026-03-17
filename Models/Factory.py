@@ -18,7 +18,7 @@ class ChatModelFactory:
     }
 
     @classmethod
-    def get_model(cls, model_name: str, use_azure: bool = False):
+    def get_model(cls):
         # 换成开源模型试试
         # https://siliconflow.cn/
         # 一个 Model-as-a-Service 平台
