@@ -67,14 +67,7 @@ python main.py
 
 ## 常见问题
 
-### Q1：`export HNSWLIB_NO_NATIVE=1` 有什么用？
-
-它用于控制 **HNSW（近似向量检索）相关依赖**在安装/运行时是否使用原生扩展（native code）。  
-通常影响的依赖链包括：`hnswlib` / `chroma-hnswlib` / `chromadb` 这类向量库组件（不同版本/平台表现不同）。
-
-如果你当前 Demo 不使用这些依赖或未触发编译问题，一般不需要设置。
-
-### Q2：读取 Excel/PDF 报缺依赖怎么办？
+### Q1：读取 Excel/PDF 报缺依赖怎么办？
 
 常见依赖：
 

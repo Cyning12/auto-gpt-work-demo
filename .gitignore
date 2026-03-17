@@ -136,11 +136,6 @@ venv.bak/
 data/*.xlsx
 data/*.pdf
 
-# Keep curated demo data
-!data/2023年8月-9月销售记录.xlsx
-!data/供应商名录.xlsx
-!data/供应商资格要求.pdf
-!data/2026-03-17-react-agent-learning.md
 
 # Spyder project settings
 .spyderproject
