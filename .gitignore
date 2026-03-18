@@ -136,6 +136,9 @@ venv.bak/
 data/*.xlsx
 data/*.pdf
 
+# Study materials (keep repo lightweight)
+data/基础原理/
+
 
 # Spyder project settings
 .spyderproject
