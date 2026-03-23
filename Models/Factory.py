@@ -26,7 +26,7 @@ class ChatModelFactory:
         return ChatOpenAI(
             model="Pro/moonshotai/Kimi-K2.5",  # 模型名称
             openai_api_key=os.getenv("SILICONFLOW_API_KEY"),  # 在平台注册账号后获取
-            openai_api_base="https://api.siliconflow.cn/v1",  # 平台 API 地址
+            openai_api_base=os.getenv("SILICONFLOW_API_URL"),  # 平台 API 地址
             **cls.model_params,
         )
 
