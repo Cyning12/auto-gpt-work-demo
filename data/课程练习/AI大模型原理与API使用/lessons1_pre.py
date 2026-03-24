@@ -1,4 +1,3 @@
-from http import HTTPStatus
 import os
 import sys
 from pathlib import Path
@@ -9,67 +8,24 @@ import json
 import random
 from collections.abc import Mapping
 
+# 与 utils 同位于「课程练习」目录下：…/课程练习/utils.py
+_practice_root = Path(__file__).resolve().parents[1]
+if str(_practice_root) not in sys.path:
+    sys.path.insert(0, str(_practice_root))
+from utils import (
+    generation_first_message,
+    message_function_call,
+    pick,
+    prompt_back_or_exit,
+)
+
 
 # 优先加载「本脚本所在目录」的 .env，避免只在仓库根目录有配置时读不到
 _here = Path(__file__).resolve().parent
 load_dotenv(_here / ".env")
 load_dotenv()
-
-
 api_key = (os.getenv("BAILIAN_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or "").strip()
 dashscope.api_key = api_key or None
-
-# 工具调用相关方法
-
-
-# 优先使用 dict 的 get 方法，然后使用对象的 getattr 方法
-# 支持 dict 和对象
-# 支持 UserDict等映射对象
-def pick(obj, key: str, default=None):
-    if isinstance(obj, Mapping):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
-
-
-# 获取 message 中的第一条 assistant message
-def _generation_first_message(response):
-    """
-    从 DashScope Generation 响应里取出第一条 assistant message。
-
-    与 OpenAI 不同：百炼返回里 choices 在 output 下，即 response.output.choices，
-    而不是顶层的 response.choices（访问后者会 KeyError）。
-    """
-    if response is None:
-        print("获取第一条 assistant message 失败，response 为空")
-        return None
-    if getattr(response, "status_code", None) != HTTPStatus.OK:
-        print("获取第一条 assistant message 失败，状态码：", response.status_code)
-        return None
-    output = (
-        response.get("output")
-        if hasattr(response, "get")
-        else getattr(response, "output", None)
-    )
-    if not output:
-        print("获取第一条 assistant message 失败，output 为空")
-        return None
-    choices = output.get("choices") if hasattr(output, "get") else output["choices"]
-    if not choices:
-        return None
-    first = choices[0]
-    msg = first.get("message") if hasattr(first, "get") else first["message"]
-    return msg
-
-
-# 获取 message 中的 function_call
-def _message_function_call(message):
-    """message 可能是 dict 或 DashScope 的类 dict 对象。"""
-    if message is None:
-        return None
-    if isinstance(message, dict):
-        return message.get("function_call")
-    return getattr(message, "function_call", None)
-
 
 # 覆盖 SDK 启动时从环境读到的 base（修复空字符串 / 错填其它厂商 URL）
 # dashscope.base_http_api_url = _resolve_dashscope_http_base()
@@ -103,7 +59,7 @@ def case1():
         messages=messages,
     )
     print(response)
-    _prompt_back_or_exit()
+    prompt_back_or_exit()
 
 
 # case2:
@@ -174,18 +130,6 @@ def get_case2_response(messages: list[dict]):
         return None
 
 
-def _prompt_back_or_exit() -> None:
-    """case 结束后统一提示：back 回主菜单，exit 结束程序。"""
-    while True:
-        cmd = input("\n输入 back 返回主菜单，exit 退出程序: ").strip().lower()
-        if cmd == "exit":
-            print("再见")
-            sys.exit(0)
-        if cmd == "back":
-            return
-        print("无效输入，请输入 back 或 exit")
-
-
 def case2():
     messages = [
         {
@@ -210,7 +154,7 @@ def case2():
             }
         )
         response = get_case2_response(messages)
-        message = _generation_first_message(response)
+        message = generation_first_message(response)
         if message is None:
             print("第一次查询失败，请重试", response)
             continue
@@ -218,7 +162,7 @@ def case2():
         messages.append(message)
         print("messages=", messages)
 
-        function_call = _message_function_call(message)
+        function_call = message_function_call(message)
         if function_call:
             function_name = (
                 function_call.get("name")
@@ -254,7 +198,7 @@ def case2():
 
                 response = get_case2_response(messages)
 
-                message = _generation_first_message(response)
+                message = generation_first_message(response)
                 if message is None:
                     print("工具调用失败，请重试")
                     continue
@@ -264,7 +208,7 @@ def case2():
             else:
                 print("不支持的函数调用")
 
-        print("最终答案：", _generation_first_message(response).content)
+        print("最终答案：", generation_first_message(response).content)
         print("--------------------------------")
 
 
@@ -302,7 +246,7 @@ def case3():
     ]
     response = get_case3_response(messages)
     print("response=", response.output)
-    _prompt_back_or_exit()
+    prompt_back_or_exit()
 
 
 # case4:
@@ -429,10 +373,6 @@ def case4():
             print("final_response=", final_response)
 
         # print("response=", response)
-
-
-# case5:
-#
 
 
 def _print_main_menu() -> None:
