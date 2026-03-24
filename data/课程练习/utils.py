@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import sys
 from collections.abc import Mapping
+from datetime import date, datetime
 from http import HTTPStatus
 from pathlib import Path
 
@@ -92,6 +95,91 @@ def pick(obj, key: str, default=None):
     if isinstance(obj, Mapping):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def coerce_for_jsonl(obj):
+    """
+    递归规范化，使 ``json.dumps(..., allow_nan=False)`` 能写出合法 JSON。
+    处理非 str 的 dict 键、NaN/Inf、SDK 返回对象等。
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, int):
+        return obj
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return str(obj)
+        return obj
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    if isinstance(obj, Mapping):
+        return {str(k): coerce_for_jsonl(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [coerce_for_jsonl(v) for v in obj]
+    return str(obj)
+
+
+def append_practice_jsonl_line(
+    log_dir: Path | str,
+    record: dict,
+    *,
+    secondary: bool = False,
+) -> Path:
+    """
+    向 ``log_dir/YYYY-MM-DD.jsonl`` 追加一行练习日志。
+
+    - ``secondary=True`` 时写入 ``YYYY-MM-DD_secondary.jsonl``（如二级摘要专用）。
+    - 写入后 ``flush`` + ``fsync``，避免「脚本未结束则文件看起来为空」。
+    - 主失败时尝试写入一条 ``event: log_write_error`` 占位行。
+    """
+    log_dir = Path(log_dir).expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    row = dict(record)
+    row.setdefault("logged_at", datetime.now().isoformat(timespec="seconds"))
+    d = date.today().isoformat()
+    filename = f"{d}_secondary.jsonl" if secondary else f"{d}.jsonl"
+    path = (log_dir / filename).resolve()
+    try:
+        line = json.dumps(
+            coerce_for_jsonl(row),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+    except Exception as e:
+        print(f"[append_practice_jsonl_line] 写入失败 {path}: {e}", file=sys.stderr)
+        try:
+            fb = {
+                "event": "log_write_error",
+                "logged_at": datetime.now().isoformat(timespec="seconds"),
+                "detail": repr(e),
+                "original_event": record.get("event"),
+            }
+            line2 = json.dumps(
+                coerce_for_jsonl(fb),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line2 + "\n")
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+        except Exception as e2:
+            print(f"[append_practice_jsonl_line] 兜底仍失败: {e2}", file=sys.stderr)
+    return path
 
 
 def generation_first_message(response):

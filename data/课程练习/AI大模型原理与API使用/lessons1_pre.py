@@ -1,5 +1,8 @@
 import os
 import sys
+import uuid
+from datetime import date
+from http import HTTPStatus
 from pathlib import Path
 import dashscope
 from dotenv import load_dotenv
@@ -13,6 +16,7 @@ _practice_root = Path(__file__).resolve().parents[1]
 if str(_practice_root) not in sys.path:
     sys.path.insert(0, str(_practice_root))
 from utils import (
+    append_practice_jsonl_line,
     generation_first_message,
     message_function_call,
     pick,
@@ -299,6 +303,7 @@ def get_case4_response(messages: list[dict]):
 
 
 def case4():
+    log_dir = _here / "log"
     while True:
         content = input("请输入告警信息（输入 back 返回菜单，exit 退出程序）: ")
         cmd = content.strip().lower()
@@ -307,6 +312,7 @@ def case4():
             sys.exit(0)
         if cmd == "back":
             return
+        session_id = uuid.uuid4().hex
         messages = [
             {
                 "role": Role.SYSTEM,
@@ -314,65 +320,162 @@ def case4():
             },
             {"role": Role.USER, "content": content},
         ]
+        append_practice_jsonl_line(
+            log_dir,
+            {
+                "script": "lessons1_pre",
+                "event": "session_start",
+                "session_id": session_id,
+                "user_input": content,
+            },
+        )
+        print(
+            f"[log] 本回话日志: {(log_dir.resolve() / f'{date.today().isoformat()}.jsonl')}",
+            flush=True,
+        )
+
         response = get_case4_response(messages)
-        response_message = response.output.choices[0].message
-        tool_call = response_message.tool_calls[0]
-        print("tool_call=", tool_call)
-        if tool_call:
-            print("tool_call.function=", tool_call["function"])
-            # pick(obj, key, default) 的第三个参数是「缺 key 时的默认值」，不是嵌套字段名。
-            # 应先取出 function 子对象，再取 name / arguments。
-            call_function = pick(tool_call, "function") or {}
-            print("call_function=", call_function)
-            function_call_name = pick(call_function, "name")
-            function_call_args_raw = pick(call_function, "arguments", "{}")
-            print("function_call_name=", function_call_name)
-            print("function_call_args_raw=", function_call_args_raw)
-
-            if isinstance(function_call_args_raw, str):
-                arguments_json = (
-                    json.loads(function_call_args_raw)
-                    if function_call_args_raw.strip()
-                    else {}
-                )
-            elif isinstance(function_call_args_raw, Mapping):
-                arguments_json = dict(function_call_args_raw)
-            else:
-                arguments_json = {}
-
-            if not function_call_name or function_call_name not in globals():
-                print("未知或缺失的函数名:", function_call_name)
-                continue
-            function = globals()[function_call_name]
-            tool_response = function(**arguments_json)
-
-            # 百炼/OpenAI 规范：tool 消息必须紧跟在「带 tool_calls 的 assistant」之后。
-            # 之前只 append 了 tool，没有 append  assistant，会报：
-            # messages with role "tool" must be a response to a preceeding message with "tool_calls"
-            assistant_content = pick(response_message, "content")
-            if assistant_content is None:
-                assistant_content = ""
-            tool_calls_list = pick(response_message, "tool_calls")
-            messages.append(
+        if response is None or getattr(response, "status_code", None) != HTTPStatus.OK:
+            append_practice_jsonl_line(
+                log_dir,
                 {
-                    "role": Role.ASSISTANT,
-                    "content": assistant_content,
-                    "tool_calls": tool_calls_list,
-                }
+                    "script": "lessons1_pre",
+                    "event": "request_failed",
+                    "session_id": session_id,
+                    "api_round": 1,
+                    "status_code": getattr(response, "status_code", None)
+                    if response
+                    else None,
+                },
             )
-            tool_info = {
-                "role": "tool",
-                "tool_call_id": pick(tool_call, "id"),
-                "name": function_call_name,
-                "content": tool_response,
+            print("请求失败，详情已写入日志。")
+            continue
+
+        output = pick(response, "output")
+        choices = pick(output, "choices") if output else None
+        if not choices:
+            append_practice_jsonl_line(
+                log_dir,
+                {
+                    "script": "lessons1_pre",
+                    "event": "no_choices",
+                    "session_id": session_id,
+                    "api_round": 1,
+                },
+            )
+            print("响应无 choices，详情已写入日志。")
+            continue
+
+        response_message = pick(choices[0], "message")
+        tool_calls_list = pick(response_message, "tool_calls")
+        finish_1 = pick(choices[0], "finish_reason")
+        ac1 = pick(response_message, "content")
+        if ac1 is None:
+            ac1 = ""
+
+        append_practice_jsonl_line(
+            log_dir,
+            {
+                "script": "lessons1_pre",
+                "event": "api_turn",
+                "session_id": session_id,
+                "api_round": 1,
+                "request_id": pick(response, "request_id"),
+                "status_code": getattr(response, "status_code", None),
+                "finish_reason": finish_1,
+                "called_tool": bool(tool_calls_list),
+                "assistant_content": ac1,
+                "tool_calls_requested": tool_calls_list,
+            },
+        )
+
+        if not tool_calls_list:
+            print("模型未发起工具调用，已记入日志。assistant:", ac1 or "(空)")
+            continue
+
+        tool_call = tool_calls_list[0]
+        print("tool_call=", tool_call)
+        print("tool_call.function=", tool_call["function"])
+        call_function = pick(tool_call, "function") or {}
+        print("call_function=", call_function)
+        function_call_name = pick(call_function, "name")
+        function_call_args_raw = pick(call_function, "arguments", "{}")
+        print("function_call_name=", function_call_name)
+        print("function_call_args_raw=", function_call_args_raw)
+
+        if isinstance(function_call_args_raw, str):
+            arguments_json = (
+                json.loads(function_call_args_raw)
+                if function_call_args_raw.strip()
+                else {}
+            )
+        elif isinstance(function_call_args_raw, Mapping):
+            arguments_json = dict(function_call_args_raw)
+        else:
+            arguments_json = {}
+
+        if not function_call_name or function_call_name not in globals():
+            print("未知或缺失的函数名:", function_call_name)
+            append_practice_jsonl_line(
+                log_dir,
+                {
+                    "script": "lessons1_pre",
+                    "event": "unknown_tool",
+                    "session_id": session_id,
+                    "function_call_name": function_call_name,
+                },
+            )
+            continue
+        function = globals()[function_call_name]
+        tool_response = function(**arguments_json)
+
+        assistant_content = ac1
+        messages.append(
+            {
+                "role": Role.ASSISTANT,
+                "content": assistant_content,
+                "tool_calls": tool_calls_list,
             }
-            print("tool_info=", tool_info)
-            messages.append(tool_info)
+        )
+        tool_info = {
+            "role": "tool",
+            "tool_call_id": pick(tool_call, "id"),
+            "name": function_call_name,
+            "content": tool_response,
+        }
+        print("tool_info=", tool_info)
+        messages.append(tool_info)
 
-            final_response = get_case4_response(messages)
-            print("final_response=", final_response)
-
-        # print("response=", response)
+        final_response = get_case4_response(messages)
+        fr_out = None
+        fr_msg = None
+        fr_finish = None
+        if final_response and getattr(final_response, "status_code", None) == HTTPStatus.OK:
+            fr_out = pick(final_response, "output")
+            fr_choices = pick(fr_out, "choices") if fr_out else None
+            if fr_choices:
+                fr_msg = pick(fr_choices[0], "message")
+                fr_finish = pick(fr_choices[0], "finish_reason")
+        append_practice_jsonl_line(
+            log_dir,
+            {
+                "script": "lessons1_pre",
+                "event": "api_turn",
+                "session_id": session_id,
+                "api_round": 2,
+                "request_id": pick(final_response, "request_id")
+                if final_response
+                else None,
+                "status_code": getattr(final_response, "status_code", None)
+                if final_response
+                else None,
+                "finish_reason": fr_finish,
+                "called_tool": False,
+                "assistant_content": pick(fr_msg, "content") if fr_msg else None,
+                "tool_result_preview": str(tool_response)[:2000],
+            },
+        )
+        print("final_response=", final_response)
 
 
 def _print_main_menu() -> None:
