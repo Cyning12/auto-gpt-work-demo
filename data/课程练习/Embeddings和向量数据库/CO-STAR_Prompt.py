@@ -27,9 +27,7 @@ _log_override = (
     os.environ.get("CO_STAR_LOG_DIR") or os.environ.get("PRACTICE_JSONL_LOG_DIR") or ""
 ).strip()
 LOG_DIR = (
-    Path(_log_override).expanduser().resolve()
-    if _log_override
-    else (_here / "log")
+    Path(_log_override).expanduser().resolve() if _log_override else (_here / "log")
 )
 # 单条 tool 返回写入「本轮汇总行」时的最大字符数
 _LOG_TOOL_CONTENT_MAX = 12000
@@ -204,6 +202,110 @@ def _tool_arguments_to_dict(raw) -> dict:
     return {}
 
 
+# Map-Reduce 长文预处理（与主对话 tools 无关的纯文本补全）
+_MAP_REDUCE_MODEL = os.environ.get("MAP_REDUCE_MODEL") or "qwen-turbo"
+MAP_REDUCE_CHUNK_SIZE = int(os.environ.get("MAP_REDUCE_CHUNK_SIZE") or "4000")
+MAP_REDUCE_OVERLAP = int(os.environ.get("MAP_REDUCE_OVERLAP") or "400")
+
+
+def _split_content_chunks(content: str, chunk_size: int, overlap: int) -> list[str]:
+    """按字符长度滑动窗口切分；overlap 为相邻块尾部与头部的重叠长度。"""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size 必须为正整数")
+    if overlap < 0 or overlap >= chunk_size:
+        raise ValueError("overlap 须满足 0 <= overlap < chunk_size")
+    n = len(content)
+    if n == 0:
+        return []
+    chunks: list[str] = []
+    start = 0
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunks.append(content[start:end])
+        if end >= n:
+            break
+        start = end - overlap
+    return chunks
+
+
+def _generation_plain_text(system: str, user: str) -> str | None:
+    """无 tools 的单次生成，返回 assistant 文本；失败返回 None。"""
+    try:
+        response = dashscope.Generation.call(
+            model=_MAP_REDUCE_MODEL,
+            messages=[
+                {"role": Role.SYSTEM, "content": system},
+                {"role": Role.USER, "content": user},
+            ],
+            result_format="message",
+        )
+        if response is None or getattr(response, "status_code", None) != HTTPStatus.OK:
+            return None
+        output = pick(response, "output")
+        choices = pick(output, "choices") if output else None
+        if not choices:
+            return None
+        msg = pick(choices[0], "message")
+        text = pick(msg, "content")
+        if text is None:
+            return None
+        s = str(text).strip()
+        return s if s else None
+    except Exception:
+        return None
+
+
+def process_long_file(
+    content: str,
+    chunk_size: int = MAP_REDUCE_CHUNK_SIZE,
+    overlap: int = MAP_REDUCE_OVERLAP,
+) -> str:
+    """
+    Map-Reduce 式预处理：长文本切块 → 每块单独摘要（Map）→ 合并为一份总摘要（Reduce）。
+
+    - 按字符切片，不保证在段落/句子边界截断（课程练习用）。
+    - 需配置可用的 DashScope API Key；任一步失败则返回已得部分的降级文本说明。
+    """
+    if not isinstance(content, str):
+        content = str(content)
+    if not content:
+        return ""
+
+    chunks = _split_content_chunks(content, chunk_size, overlap)
+    if not chunks:
+        return ""
+
+    map_system = (
+        "你是文档摘要助手。用户会给出长文档中的一段连续文字（可能从句中切开）。"
+        "请用中文输出该段的结构化短摘要：保留出现的标题/编号/条款号、数字、联系人、步骤要点；"
+        "不要编造片段中不存在的信息。"
+    )
+    partial_summaries: list[str] = []
+    for i, ch in enumerate(chunks):
+        header = f"[分块 {i + 1}/{len(chunks)}，约 {len(ch)} 字符]\n"
+        piece = _generation_plain_text(map_system, header + ch)
+        if piece is None:
+            piece = f"（第 {i + 1} 块摘要失败，保留原文前 500 字）\n{ch[:500]}"
+        partial_summaries.append(f"### 分块 {i + 1} 摘要\n{piece}")
+
+    merged_input = "\n\n".join(partial_summaries)
+    reduce_system = (
+        "下面是同一篇长文档各分块的摘要，块与块之间可能有少量内容重叠。"
+        "请合并为一份连贯的中文总摘要：去重、统一术语，保留全部关键事实与编号；"
+        "不要添加各分块摘要中均未出现的内容。"
+    )
+    final_text = _generation_plain_text(
+        reduce_system,
+        f"共分 {len(chunks)} 块。\n\n{merged_input}",
+    )
+    if final_text is None:
+        return "[Map-Reduce] Reduce 步骤失败，仅返回各分块摘要拼接：\n\n" + merged_input
+    return (
+        f"[Map-Reduce] 原文字符 {len(content)}，块大小 {chunk_size}，重叠 {overlap}，共 {len(chunks)} 块。\n\n"
+        + final_text
+    )
+
+
 def _json_safe(obj):
     """转为可 json.dumps 的结构（用于 JSONL）；失败时降级为可序列化占位，避免整轮日志丢失。"""
     try:
@@ -267,8 +369,8 @@ def _secondary_summary_tool_output(
     raw_text: str, *, source_path: str | None = None
 ) -> str:
     """
-    对过长工具原文做一次独立调用压缩，不携带 tools，避免与主会话 tool 协议纠缠。
-    失败时退回截断原文，保证主流程仍可用。每次调用写一行 ``*_secondary.jsonl``。
+    对过长 ``read_local_file`` 原文走 Map-Reduce（``process_long_file``），再交给主对话。
+    不携带 tools；失败时退回截断原文。每次调用写一行 ``*_secondary.jsonl``。
     """
     orig_len = len(raw_text)
     cap = 8000
@@ -276,87 +378,39 @@ def _secondary_summary_tool_output(
         "source_path": source_path,
         "original_chars": orig_len,
         "threshold_chars": TOOL_OUTPUT_SUMMARY_THRESHOLD_CHARS,
-        "model": "qwen-turbo",
+        "model": _MAP_REDUCE_MODEL,
+        "mode": "map_reduce",
+        "chunk_size": MAP_REDUCE_CHUNK_SIZE,
+        "overlap": MAP_REDUCE_OVERLAP,
     }
     try:
-        response = dashscope.Generation.call(
-            model="qwen-turbo",
-            messages=[
-                {
-                    "role": Role.SYSTEM,
-                    "content": (
-                        "你是文档压缩助手。将用户给出的企业内部文档节选压缩为结构化短摘要："
-                        "保留标题/文档编号/条款号、关键数字、联系人、操作步骤要点。"
-                        "禁止编造原文没有的信息。输出中文。"
-                    ),
-                },
-                {"role": Role.USER, "content": raw_text},
-            ],
-            result_format="message",
+        merged = process_long_file(
+            raw_text,
+            chunk_size=MAP_REDUCE_CHUNK_SIZE,
+            overlap=MAP_REDUCE_OVERLAP,
         )
-        req_id = pick(response, "request_id") if response else None
-        st = getattr(response, "status_code", None) if response else None
-        if response is None or st != HTTPStatus.OK:
-            _log_secondary_summary(
-                {
-                    **base_log,
-                    "ok": False,
-                    "outcome": "api_error",
-                    "status_code": st,
-                    "request_id": req_id,
-                }
-            )
-            tail = f"\n...[truncated, total={orig_len}]" if orig_len > cap else ""
-            return (
-                f"[二级摘要请求失败，返回原文前 {cap} 字]\n"
-                + raw_text[:cap]
-                + tail
-            )
-        output = pick(response, "output")
-        choices = pick(output, "choices") if output else None
-        if not choices:
-            _log_secondary_summary(
-                {
-                    **base_log,
-                    "ok": False,
-                    "outcome": "no_choices",
-                    "status_code": st,
-                    "request_id": req_id,
-                }
-            )
-            return raw_text[:cap] + (
-                f"\n...[truncated, total={orig_len}]" if orig_len > cap else ""
-            )
-        msg = pick(choices[0], "message")
-        summary = pick(msg, "content")
-        if summary is None or not str(summary).strip():
-            _log_secondary_summary(
-                {
-                    **base_log,
-                    "ok": False,
-                    "outcome": "empty_summary",
-                    "status_code": st,
-                    "request_id": req_id,
-                }
-            )
-            return raw_text[:cap] + (
-                f"\n...[truncated, total={orig_len}]" if orig_len > cap else ""
-            )
-        s = str(summary).strip()
+        reduce_failed = "Reduce 步骤失败" in merged
+        partial_map_failed = "块摘要失败" in merged
         _log_secondary_summary(
             {
                 **base_log,
-                "ok": True,
-                "outcome": "ok",
-                "status_code": st,
-                "request_id": req_id,
-                "summary_chars": len(s),
-                "summary_preview": s[:600],
+                "ok": not reduce_failed,
+                "outcome": (
+                    "map_reduce_partial"
+                    if partial_map_failed and not reduce_failed
+                    else (
+                        "map_reduce_reduce_failed" if reduce_failed else "map_reduce_ok"
+                    )
+                ),
+                "result_chars": len(merged),
+                "summary_preview": merged[:600],
             }
         )
         return (
-            f"[二级摘要] 原文 {orig_len} 字符（阈值 {TOOL_OUTPUT_SUMMARY_THRESHOLD_CHARS}），摘要如下：\n"
-            f"{s}"
+            f"[read_local_file → Map-Reduce 预处理] 原文 {orig_len} 字符"
+            f"（阈值 {TOOL_OUTPUT_SUMMARY_THRESHOLD_CHARS}，块 {MAP_REDUCE_CHUNK_SIZE}"
+            f"/重叠 {MAP_REDUCE_OVERLAP}）。\n\n"
+            f"{merged}"
         )
     except Exception as e:
         _log_secondary_summary(
@@ -368,7 +422,11 @@ def _secondary_summary_tool_output(
             }
         )
         tail = f"\n...[truncated, total={orig_len}]" if orig_len > cap else ""
-        return f"[二级摘要异常 {e!r}，返回原文前 {cap} 字]\n" + raw_text[:cap] + tail
+        return (
+            f"[Map-Reduce 预处理异常 {e!r}，返回原文前 {cap} 字]\n"
+            + raw_text[:cap]
+            + tail
+        )
 
 
 def _invoke_tool_function(name: str, arguments_json: dict) -> str:
