@@ -12,6 +12,7 @@ _practice_root = Path(__file__).resolve().parents[1]
 if str(_practice_root) not in sys.path:
     sys.path.insert(0, str(_practice_root))
 from utils import append_practice_jsonl_line, list_doc_files, pick, read_local_file
+from constants import PROFESSIONAL_SYSTEM_TEMPLATE
 
 import dashscope
 from dotenv import load_dotenv
@@ -45,31 +46,7 @@ load_dotenv()
 api_key = (os.getenv("BAILIAN_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or "").strip()
 dashscope.api_key = api_key or None
 
-# CO-STAR 模板：放入 system，不再使用 Generation.call 的 prompt=（避免被 SDK 追加为多余 user）
-_CO_STAR_SYSTEM_BLOCK = """
-【CO-STAR 写作约束】
-# Context（上下文）
-你是一名资深运维专家。现在你需要根据提供的【企业内部文档】片段或工具返回的事实，回答用户关于服务器异常与制度类问题。
-
-# Objective（目标）
-仅基于提供的文档内容或工具结果回答。如果文档与工具结果中都没有相关信息，请诚实告知「知识库中暂无此记录」，严禁幻觉。
-
-# Style（风格）
-模仿高级 SRE 工程师的排障日志格式。使用 Markdown 的代码块展示技术参数，使用无序列表呈现逻辑步骤。每一段文字不要超过 3 行。
-
-# Tone（语气）
-保持极度的专业和客观。避免使用「我觉得」「可能」等模糊词汇。在指出系统错误时，语气要直接、果断，不带任何感情色彩。
-
-# Audience（受众）
-面向值班运维工程师，需要直接给出操作建议。
-
-# Response（响应格式）
-输出格式：
-1. 问题定位：...
-2. 参考文档：[文档标题/编号]
-3. 建议操作：...
-（RAG 场景下可将检索片段写在「参考依据」中；本练习中对应工具读到的文件内容。）
-""".strip()
+# System 主模板见 constants.PROFESSIONAL_SYSTEM_TEMPLATE；工具分流规则在 _case4_system_content 末尾拼接。
 
 
 def _case4_system_content() -> str:
@@ -85,7 +62,16 @@ def _case4_system_content() -> str:
         "3）若用户同时需要流程与实时数据：先完成文档检索与阅读，再决定是否调用 get_current_status。\n"
         "回答时注明信息来自哪份文件名中的条款（若读过文件）。"
     )
-    return f"{_CO_STAR_SYSTEM_BLOCK}\n\n---\n\n{tool_rules}"
+    system_template = PROFESSIONAL_SYSTEM_TEMPLATE.format(
+        role_definition="你是一名资深运维专家。根据工具返回的企业内部文档片段或监控数据，回答用户关于服务器异常与制度类问题。",
+        audience="面向值班运维工程师；回答应可直接用于值班与排障决策，给出清晰、可执行的操作建议。",
+        constraints="仅基于 tool 返回的文档正文或 JSON 作答；不得编造工具结果中不存在的条款、数字、联系人。信息不足时明确说明。",
+        output_format="输出格式：\n1. 问题定位：...\n2. 参考文档：[文档标题/编号]\n3. 建议操作：...",
+        language="中文",
+        style="模仿高级 SRE 工程师的排障日志格式。使用 Markdown 代码块展示技术参数，用无序列表呈现步骤；每段文字尽量不超过 3 行。",
+        tone="保持专业、客观；避免「我觉得」「可能」等模糊表述；指出系统问题时语气直接、果断。",
+    )
+    return f"{system_template}\n\n---\n\n{tool_rules}"
 
 
 # 通过第三方接口获取数据库服务器状态
