@@ -12,11 +12,13 @@ distro==1.9.0
 dotenv==0.9.9
 et_xmlfile==2.0.0
 frozenlist==1.8.0
+gensim==4.4.0
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
 httpx-sse==0.4.3
 idna==3.11
+jieba==0.42.1
 jiter==0.13.0
 jsonpatch==1.33
 jsonpointer==3.0.0
