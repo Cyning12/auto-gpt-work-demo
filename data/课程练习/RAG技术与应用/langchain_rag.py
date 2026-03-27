@@ -4,8 +4,8 @@
 # Step1，收集整理知识库 (./source/焦点科技公司制度)
 # Step2，从PDF中提取文本并记录每行文本对应的页码
 # Step3，处理文本并创建向量存储
-# Step4，执行相似度搜索，找到与查询相关的文档
-# Step5，使用问到链对用户问题进行回答 （使用你的DASHSCOPE_API_KEY）
+# Step4，执行相似度搜索，找到与查询相关的文档（可选 gte-rerank-v2 精排）
+# Step5，使用问到链对用户问题进行回答 （使用你的DASHSCOPE_API_KEY；默认先精排再拼上下文）
 # Step6，显示每个文档块的来源页码
 # 直接运行本脚本：进入终端交互问答；子命令 sync / search / ask 见 --help
 from __future__ import annotations
@@ -55,6 +55,7 @@ PROFESSIONAL_SYSTEM_TEMPLATE = """
 2. 严禁使用“参考其他委员会”或“根据常识”进行类比推理。
 3. 如果已知信息之间存在冲突，请全部列出并提示差异。
 4. 如果已知信息中提到比例（如三分之二），请根据该比例计算并回答用户关于具体人数（如一半）的问题。
+5. 请在回答时，必须明确指出信息来源于哪份文件以及对应的页码（例如：根据《XXX》第 X 页所述...）。
 """
 
 
@@ -84,8 +85,12 @@ _METADATA_DEPARTMENT = "company"
 _METADATA_UPDATE_TIME = "2026-03-27"
 # similarity = 1/(1+distance)，非概率；仅作单调标尺。默认仅保留 similarity >= 该值的片段
 _DEFAULT_SIMILARITY_THRESHOLD = 0.3
-# 检索参与上下文的分块条数默认上限（RAG 作答与 similarity_search 一致）
-_DEFAULT_TOP_K = 10
+# 检索参与上下文的分块条数默认上限（向量召回条数；RAG 作答后接精排重排同一批）
+_DEFAULT_TOP_K = 20
+# DashScope 文本精排模型（与向量 embedding 模型独立）
+_RERANK_MODEL = "gte-rerank-v2"
+_RERANK_RETRY = 5
+_RERANK_RETRY_BASE_SEC = 2.0
 
 _logger = logging.getLogger(__name__)
 
@@ -706,6 +711,92 @@ def _faiss_distance_to_similarity(distance: float) -> float:
     return 1.0 / (1.0 + d)
 
 
+def _call_dashscope_rerank(
+    query: str,
+    documents: list[str],
+    *,
+    top_n: int,
+    api_key: str,
+) -> Any:
+    """调用 TextReRank，网络类错误按指数退避重试。"""
+    delay = _RERANK_RETRY_BASE_SEC
+    last: BaseException | None = None
+    for attempt in range(1, _RERANK_RETRY + 1):
+        try:
+            return dashscope.TextReRank.call(
+                model=_RERANK_MODEL,
+                query=query,
+                documents=documents,
+                top_n=top_n,
+                return_documents=False,
+                api_key=api_key or None,
+            )
+        except _RETRYABLE_REQUEST_ERRORS as e:
+            last = e
+            _logger.warning(
+                "DashScope Rerank 网络异常（%d/%d）: %s，%.0fs 后重试",
+                attempt,
+                _RERANK_RETRY,
+                e,
+                delay,
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)
+    assert last is not None
+    raise last
+
+
+def rerank_retrieval_hits(
+    query: str,
+    hits: list[dict[str, Any]],
+    *,
+    top_n: int | None = None,
+    api_key: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    使用 DashScope ``gte-rerank-v2`` 对已有向量检索结果重排序，提升问答上下文相关性。
+
+    - 在每条 hit 上增加 ``rerank_score``；保留原 ``similarity`` / ``distance`` 为向量检索标尺。
+    - 若接口失败则记录警告并**原样返回** ``hits``（不中断 RAG）。
+    """
+    if not hits:
+        return []
+    key = (api_key or _api_key).strip()
+    n = top_n if top_n is not None else len(hits)
+    n = max(1, min(n, len(hits)))
+    docs = [str(h.get("content", "") or "") for h in hits]
+    try:
+        resp = _call_dashscope_rerank(query, docs, top_n=n, api_key=key)
+    except Exception as e:
+        _logger.warning("Rerank 请求异常，回退为向量检索顺序：%s", e)
+        return hits
+    if getattr(resp, "status_code", None) != HTTPStatus.OK:
+        _logger.warning(
+            "Rerank 非成功响应，回退为向量检索顺序：status_code=%r message=%r",
+            getattr(resp, "status_code", None),
+            getattr(resp, "message", None),
+        )
+        return hits
+    output = getattr(resp, "output", None)
+    if output is None or not getattr(output, "results", None):
+        _logger.warning("Rerank 返回无 output.results，回退为向量检索顺序")
+        return hits
+    out: list[dict[str, Any]] = []
+    for res in output.results:
+        idx = int(res.index if hasattr(res, "index") else res["index"])
+        if idx < 0 or idx >= len(hits):
+            continue
+        row = dict(hits[idx])
+        rs = float(
+            res.relevance_score
+            if hasattr(res, "relevance_score")
+            else res["relevance_score"]
+        )
+        row["rerank_score"] = rs
+        out.append(row)
+    return out if out else hits
+
+
 def load_knowledge_base(
     save_dir: str | Path | None = None,
     *,
@@ -735,6 +826,7 @@ def similarity_search(
     vector_db: FAISS | None = None,
     save_dir: str | Path | None = None,
     score_threshold: float | None = _DEFAULT_SIMILARITY_THRESHOLD,
+    rerank: bool = False,
 ) -> list[dict[str, Any]]:
     """
     相似度检索（Step4）：将用户白话 ``query`` 经 ``embed_query`` 向量化，在 FAISS 中检索最相近的制度分块。
@@ -745,6 +837,7 @@ def similarity_search(
     - ``similarity``：``1/(1+distance)``，落在 ``(0, 1]``，**越大越相似**；
     - ``relevance_score``：与 ``similarity`` 相同；
     - 以及 ``source_file``、``page_number`` 等 metadata。
+    - 若 ``rerank=True``，在通过阈值后的前 ``k`` 条上调用 ``gte-rerank-v2`` 重排，并附加 ``rerank_score``。
 
     **关于 ``similarity``**：由距离单调变换得到，**不是**校准后的「概率」或语义置信度，
     但同一模型、同一索引下 **越大表示向量空间越近**，适合排序与统一阈值。
@@ -752,6 +845,7 @@ def similarity_search(
     :param k: 至多返回 k 条**通过阈值**的结果
     :param score_threshold: 仅保留 ``similarity >= score_threshold``；``None`` 表示不过滤。
         默认 ``_DEFAULT_SIMILARITY_THRESHOLD``。设阈值时会向 FAISS 多取邻居再过滤，以尽量凑满 k 条。
+    :param rerank: 是否对召回结果做 DashScope 精排（默认否，``ask``/交互 RAG 在生成阶段单独开启）。
     """
     q = (query or "").strip()
     if not q:
@@ -786,6 +880,8 @@ def similarity_search(
         )
         if len(rows) >= k:
             break
+    if rerank and rows:
+        rows = rerank_retrieval_hits(q, rows, top_n=len(rows), api_key=_api_key)
     return rows
 
 
@@ -795,6 +891,7 @@ def search_knowledge_base(
     top_k: int = _DEFAULT_TOP_K,
     *,
     score_threshold: float | None = _DEFAULT_SIMILARITY_THRESHOLD,
+    rerank: bool = False,
 ) -> list[dict[str, Any]]:
     """
     在**已加载**的 ``vector_db`` 上检索，避免重复 ``load_local``。
@@ -807,6 +904,7 @@ def search_knowledge_base(
         k=top_k,
         vector_db=vector_db,
         score_threshold=score_threshold,
+        rerank=rerank,
     )
 
 
@@ -823,8 +921,11 @@ def _format_rag_context(hits: list[dict[str, Any]]) -> str:
             head = f"[{i}] 《{src}》第 {page} 页"
         else:
             head = f"[{i}] 《{src}》"
+        rr = h.get("rerank_score")
+        if rr is not None:
+            head += f"（rerank≈{float(rr):.3f}）"
         if sim is not None:
-            head += f"（similarity≈{sim:.3f}）"
+            head += f"（向量 similarity≈{float(sim):.3f}）"
         parts.append(f"{head}\n{h.get('content', '').strip()}")
     return "\n\n---\n\n".join(parts)
 
@@ -885,11 +986,13 @@ def generate_rag_answer(
     chat_model: str | None = None,
     vector_db: FAISS | None = None,
     save_dir: str | Path | None = None,
+    use_rerank: bool = True,
 ) -> dict[str, Any]:
     """
     RAG 问答（Step5）：先用本地 FAISS 检索制度片段，再调用通用对话模型（默认 ``CHAT_MODEL``）生成回答。
 
     - **向量模型**：仅负责 ``similarity_search`` 中的 ``embed_query`` / 索引距离。
+    - **精排模型**：默认对召回的 ``top_k`` 条调用 DashScope ``gte-rerank-v2`` 重排后再拼上下文。
     - **通用模型**：负责阅读理解片段并组织自然语言答案（可通过环境变量 ``DASHSCOPE_CHAT_MODEL`` 指定）。
 
     返回 ``answer``、``model``、``retrieval``（检索分块列表）、``context``（拼好的片段正文）。
@@ -905,6 +1008,8 @@ def generate_rag_answer(
         save_dir=save_dir,
         score_threshold=score_threshold,
     )
+    if use_rerank and hits:
+        hits = rerank_retrieval_hits(q, hits, top_n=len(hits), api_key=_api_key)
     system_text = build_rag_prompt_text(q, hits)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_text},
@@ -936,12 +1041,15 @@ def _print_similarity_results(results: list[dict[str, Any]]) -> None:
         return
     for i, row in enumerate(results, start=1):
         sim = row.get("similarity", row.get("relevance_score"))
+        rr = row.get("rerank_score")
         dist = row.get("distance")
         src = row.get("source_file") or "?"
         page = row.get("page_number")
         dist_s = f"{dist:.4f}" if dist is not None else "?"
+        extra = f" | 精排={float(rr):.4f}" if rr is not None else ""
+        sim_s = f"{float(sim):.4f}" if sim is not None else "?"
         print(
-            f"\n--- 片段 {i} | 相似度={sim:.4f}（越大越好）| 距离={dist_s}（越小越好）| "
+            f"\n--- 片段 {i} | 向量相似度={sim_s}（越大越好）{extra} | 距离={dist_s}（越小越好）| "
             f"来源={src} | 页码={page} ---"
         )
         print(row.get("content", "").strip())
@@ -993,6 +1101,7 @@ def _cmd_search(args: argparse.Namespace) -> None:
         k=args.top_k,
         save_dir=_VECTOR_MODEL_PATH,
         score_threshold=_cli_score_threshold(args),
+        rerank=args.rerank,
     )
     _print_similarity_results(results)
 
@@ -1005,6 +1114,7 @@ def _cmd_ask(args: argparse.Namespace) -> None:
         score_threshold=_cli_score_threshold(args),
         save_dir=_VECTOR_MODEL_PATH,
         chat_model=args.chat_model or None,
+        use_rerank=not args.no_rerank,
     )
     print(f"[模型: {out['model']}]\n")
     print(out["answer"])
@@ -1014,7 +1124,9 @@ def _cmd_ask(args: argparse.Namespace) -> None:
             src = h.get("source_file") or "?"
             page = h.get("page_number")
             sim = h.get("similarity")
-            print(f"  {i}. {src} p.{page} sim={sim}")
+            rr = h.get("rerank_score")
+            rr_s = f" rerank={rr:.3f}" if rr is not None else ""
+            print(f"  {i}. {src} p.{page} sim={sim}{rr_s}")
 
 
 def _cmd_interactive(_args: argparse.Namespace) -> None:
@@ -1059,7 +1171,8 @@ def _cmd_help(args: argparse.Namespace) -> None:
         f"  python {script} search 考勤 -k {_DEFAULT_TOP_K}\n"
         f"  python {script} ask 年假怎么休 -v\n"
         "\n环境变量：BAILIAN_API_KEY / DASHSCOPE_API_KEY；"
-        f"对话模型 DASHSCOPE_CHAT_MODEL（默认 {CHAT_MODEL!r}）。\n"
+        f"对话模型 DASHSCOPE_CHAT_MODEL（默认 {CHAT_MODEL!r}）。"
+        f"\nRAG 默认召回 top_k={_DEFAULT_TOP_K} 后精排模型 {_RERANK_MODEL}；search 加 --rerank、ask 可加 --no-rerank。\n"
     )
 
 
@@ -1077,6 +1190,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 
     p_search = sub.add_parser("search", help="仅向量检索，打印制度片段")
     _add_query_and_retrieval_args(p_search, query_help="关键词或问题（白话）")
+    p_search.add_argument(
+        "--rerank",
+        action="store_true",
+        help=f"对召回结果使用 {_RERANK_MODEL} 精排后再输出（额外一次 DashScope 调用）",
+    )
     p_search.set_defaults(handler=_cmd_search)
 
     p_ask = sub.add_parser("ask", help="单次 RAG 问答（非交互）")
@@ -1093,6 +1211,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="打印检索片段摘要",
+    )
+    p_ask.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help=f"跳过 {_RERANK_MODEL}，仅用向量相似度作为上下文顺序",
     )
     p_ask.set_defaults(handler=_cmd_ask)
 
