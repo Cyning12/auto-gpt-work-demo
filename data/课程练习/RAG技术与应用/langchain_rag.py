@@ -9,11 +9,18 @@
 # Step6，显示每个文档块的来源页码
 from __future__ import annotations
 
+import os
+import sys
+
+# macOS：FAISS / NumPy / PyTorch 等若各自链接 libomp，OpenMP 重复初始化会 abort（OMP: Error #15）
+if sys.platform == "darwin":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import argparse
 import hashlib
 import json
 import logging
-import os
-import sys
+import re
 import time
 from pathlib import Path
 from PyPDF2 import PdfReader
@@ -29,6 +36,24 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, ConfigDict, Field
 
 from typing import Any, List, Tuple
+
+PROFESSIONAL_SYSTEM_TEMPLATE = """
+# ROLE（角色）
+你是一个严谨的公司行政助手。
+请基于以下提供的【制度片段】回答用户的问题。
+
+【已知制度】：
+{context}
+
+【用户问题】：
+{query}
+
+【注意事项】：
+1. 如果提供的【已知制度】中没有关于“请假”、“假种”、“申请流程”的具体说明，请直接回答：“抱歉，目前的规章制度库中未包含员工请假相关的具体申请流程，建议咨询 HR 部门。”
+2. 严禁根据你自身的知识储备来回答公司制度，只能依据上方提供的片段。
+3. 如果能够回答，请务必注明出处（如：参考自《XX制度》第X页）。
+"""
+
 
 # 与 langchain_community.embeddings.dashscope 中 BATCH_SIZE 一致
 _DASHSCOPE_EMBED_BATCH_SIZE: dict[str, int] = {
@@ -54,6 +79,8 @@ _PROCESSED_FILES_JSON = "processed_files.json"
 # 部门字段暂写死，后续可从配置或业务接口注入
 _METADATA_DEPARTMENT = "company"
 _METADATA_UPDATE_TIME = "2026-03-27"
+# similarity = 1/(1+distance)，非概率；仅作单调标尺。默认仅保留 similarity >= 该值的片段
+_DEFAULT_SIMILARITY_THRESHOLD = 0.5
 
 _logger = logging.getLogger(__name__)
 
@@ -340,6 +367,28 @@ def process_text_with_splitter(
     return knowledge_base
 
 
+# PDF 抽取常见控制字符与 Latin-1 增补（\x7f-\xff）；中文等不在该范围内
+_PDF_CTRL_AND_LATIN1_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\xff]")
+# 换行两侧空白，避免出现「\\n + 空格 + \\n」类冗余
+_PDF_NL_SURROUND_SPACES_RE = re.compile(r"[ \t]*\n[ \t]*")
+
+
+def _clean_pdf_extracted_text(text: str) -> str:
+    """
+    清洗 PyPDF2 抽取文本：剔除控制符与指定区段字符、替换 PDF 私用区列表符、压缩空行。
+    在分块前调用，减轻 Token 浪费与 LLM 上下文杂乱（不影响向量检索语义为主）。
+    """
+    if not text:
+        return text
+    s = _PDF_CTRL_AND_LATIN1_RE.sub("", text)
+    # Symbol/Wingdings 等常映射到私用区（如 \\uf0b2），统一为项目符号
+    for sym in ("\uf0b2", "\uf0b7", "\uf0a7", "\uf0a8", "\uf09e", "\uf0fc"):
+        s = s.replace(sym, "•")
+    s = _PDF_NL_SURROUND_SPACES_RE.sub("\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
 def extract_text_with_page_numbers(pdf) -> List[Tuple[str, int]]:
     """
     从 PDF 按页提取文本，每页一条记录，便于分块后标注准确页码。
@@ -356,8 +405,11 @@ def extract_text_with_page_numbers(pdf) -> List[Tuple[str, int]]:
         if not extracted:
             continue
         stripped = extracted.strip()
-        if stripped:
-            pages.append((stripped, page_number))
+        if not stripped:
+            continue
+        cleaned = _clean_pdf_extracted_text(stripped)
+        if cleaned:
+            pages.append((cleaned, page_number))
     return pages
 
 
@@ -602,22 +654,212 @@ def create_vector_model(
     return sync_vector_store(source_folder=_FILES_PATH, save_dir=target)
 
 
-# text, page_numbers = extract_text_with_page_numbers(
-#     read_pdf(
-#         Path(
-#             _PRACTICE_ROOT
-#             / "source"
-#             / "焦点科技公司制度"
-#             / "内幕信息知情人登记制度（2025年10月）.pdf"
-#         )
-#     )
-# )
-# print(text)
-# print(page_numbers)
+def _faiss_distance_to_similarity(distance: float) -> float:
+    """
+    将 FAISS 检索返回的距离转为便于阅读的相似度 ``(0, 1]``，越大越相关。
+
+    LangChain 默认的 ``1 - d/√2`` 假定向量已 **L2 单位化**（距离上界约 ``√2``）。
+    DashScope text-embedding 等常见 **未单位化**，距离常大于 ``√2``，会得到 **负数** 并触发
+    ``Relevance scores must be between 0 and 1`` 警告，与「检索好坏」无关。
+
+    此处用单调映射 ``1/(1+d)``：距离越小相似度越高；``d`` 为 ``IndexFlatL2`` 的原始值（一般为 **平方 L2**，
+    仅用于排序与展示，不必与物理距离单位对齐）。
+    """
+    d = float(distance)
+    if d < 0:
+        d = 0.0
+    return 1.0 / (1.0 + d)
 
 
-def main() -> None:
+def load_knowledge_base(
+    save_dir: str | Path | None = None,
+    *,
+    index_name: str = _FAISS_INDEX_NAME,
+) -> FAISS:
+    """
+    从本地目录加载 LangChain FAISS 向量库（与 ``sync_vector_store`` 落盘路径一致）。
+    需与建库时使用同一套 Embedding 模型（本脚本为 DashScope ``EMBEDDING_MODEL``）。
+    """
+    target = Path(save_dir if save_dir is not None else _VECTOR_MODEL_PATH)
+    if not vector_bundle_exists(target):
+        raise FileNotFoundError(
+            f"向量库不存在或不完整：{target}（请先运行同步：python langchain_rag.py sync）"
+        )
+    return FAISS.load_local(
+        str(target),
+        get_embeddings(),
+        index_name=index_name,
+        allow_dangerous_deserialization=True,
+    )
+
+
+def similarity_search(
+    query: str,
+    *,
+    k: int = 5,
+    vector_db: FAISS | None = None,
+    save_dir: str | Path | None = None,
+    score_threshold: float | None = _DEFAULT_SIMILARITY_THRESHOLD,
+) -> list[dict[str, Any]]:
+    """
+    相似度检索（Step4）：将用户白话 ``query`` 经 ``embed_query`` 向量化，在 FAISS 中检索最相近的制度分块。
+
+    返回字典列表，每项含：
+
+    - ``distance``：FAISS ``IndexFlatL2`` 原始距离（一般为 **平方 L2**），**越小越相似**；
+    - ``similarity``：``1/(1+distance)``，落在 ``(0, 1]``，**越大越相似**；
+    - ``relevance_score``：与 ``similarity`` 相同；
+    - 以及 ``source_file``、``page_number`` 等 metadata。
+
+    **关于 ``similarity``**：由距离单调变换得到，**不是**校准后的「概率」或语义置信度，
+    但同一模型、同一索引下 **越大表示向量空间越近**，适合排序与统一阈值。
+
+    :param k: 至多返回 k 条**通过阈值**的结果
+    :param score_threshold: 仅保留 ``similarity >= score_threshold``；``None`` 表示不过滤。
+        默认 ``_DEFAULT_SIMILARITY_THRESHOLD``（0.5）。设阈值时会向 FAISS 多取邻居再过滤，以尽量凑满 k 条。
+    """
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("query 不能为空")
+
+    db = vector_db if vector_db is not None else load_knowledge_base(save_dir=save_dir)
+    # 有阈值时多取 Top-N 再过滤，否则常出现「前 k 个邻居全不达标」而结果为空
+    fetch_n = k
+    if score_threshold is not None:
+        fetch_n = min(300, max(k * 20, 80))
+
+    pairs = db.similarity_search_with_score(q, k=fetch_n)
+    rows: list[dict[str, Any]] = []
+    for doc, dist in pairs:
+        similarity = _faiss_distance_to_similarity(dist)
+        if score_threshold is not None and similarity < score_threshold:
+            continue
+        meta = dict(doc.metadata)
+        rows.append(
+            {
+                "content": doc.page_content,
+                "distance": float(dist),
+                "similarity": similarity,
+                "relevance_score": similarity,
+                "source_file": meta.get("source_file"),
+                "page_number": meta.get("page_number"),
+                "chunk_id": meta.get("chunk_id"),
+                "file_hash": meta.get("file_hash"),
+                "department": meta.get("department"),
+                "update_time": meta.get("update_time"),
+            }
+        )
+        if len(rows) >= k:
+            break
+    return rows
+
+
+def search_knowledge_base(
+    query: str,
+    vector_db: FAISS,
+    top_k: int = 3,
+    *,
+    score_threshold: float | None = _DEFAULT_SIMILARITY_THRESHOLD,
+) -> list[dict[str, Any]]:
+    """
+    在**已加载**的 ``vector_db`` 上检索，避免重复 ``load_local``。
+
+    与 ``similarity_search(..., vector_db=...)`` 等价；默认同样应用最小相似度
+    ``_DEFAULT_SIMILARITY_THRESHOLD``。若需看全部 Top-K 不过滤，传入 ``score_threshold=None``。
+    """
+    return similarity_search(
+        query,
+        k=top_k,
+        vector_db=vector_db,
+        score_threshold=score_threshold,
+    )
+
+
+def _print_similarity_results(results: list[dict[str, Any]]) -> None:
+    """CLI 下打印检索结果（简体中文）。"""
+    if not results:
+        print(
+            "未找到相关制度片段（可提高 -k、降低 --min-score，或使用 --no-min-score 取消过滤）。"
+        )
+        return
+    for i, row in enumerate(results, start=1):
+        sim = row.get("similarity", row.get("relevance_score"))
+        dist = row.get("distance")
+        src = row.get("source_file") or "?"
+        page = row.get("page_number")
+        dist_s = f"{dist:.4f}" if dist is not None else "?"
+        print(
+            f"\n--- 片段 {i} | 相似度={sim:.4f}（越大越好）| 距离={dist_s}（越小越好）| "
+            f"来源={src} | 页码={page} ---"
+        )
+        print(row.get("content", "").strip())
+
+
+def _cmd_sync(_args: argparse.Namespace) -> None:
     sync_vector_store(source_folder=_FILES_PATH, save_dir=_VECTOR_MODEL_PATH)
+
+
+def _cmd_search(args: argparse.Namespace) -> None:
+    query = " ".join(args.query).strip()
+    thr: float | None = None if args.no_min_score else args.min_score
+    results = similarity_search(
+        query,
+        k=args.top_k,
+        save_dir=_VECTOR_MODEL_PATH,
+        score_threshold=thr,
+    )
+    _print_similarity_results(results)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="制度 RAG：同步 PDF 向量库（sync）或白话相似度检索（search）",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=False)
+
+    p_sync = sub.add_parser("sync", help="扫描 PDF、按 MD5 增量更新 FAISS")
+    p_sync.set_defaults(handler=_cmd_sync)
+
+    p_search = sub.add_parser(
+        "search",
+        help="将白话转为向量，在 FAISS 中检索最相关的制度分块",
+    )
+    p_search.add_argument(
+        "query",
+        nargs="+",
+        help="用户问题或关键词（白话）",
+    )
+    p_search.add_argument(
+        "-k",
+        "--top-k",
+        type=int,
+        default=5,
+        dest="top_k",
+        metavar="N",
+        help="最多返回 N 条分块（默认 5）",
+    )
+    p_search.add_argument(
+        "--min-score",
+        type=float,
+        default=_DEFAULT_SIMILARITY_THRESHOLD,
+        metavar="S",
+        help=(
+            f"仅保留 similarity(=1/(1+距离)) >= S，默认 {_DEFAULT_SIMILARITY_THRESHOLD}；"
+            "越大越严"
+        ),
+    )
+    p_search.add_argument(
+        "--no-min-score",
+        action="store_true",
+        help="取消相似度下限，返回距离最近的 top-k 条（调试/对比用）",
+    )
+    p_search.set_defaults(handler=_cmd_search)
+
+    args = parser.parse_args(argv)
+    if getattr(args, "handler", None) is not None:
+        args.handler(args)
+        return
+    _cmd_sync(args)
 
 
 if __name__ == "__main__":
