@@ -1,0 +1,22 @@
+# Project Context: RAG System with Python & FAISS
+- **Core Stack**: Python 3.10+, FAISS (vector database), LangChain or LlamaIndex, PDFPlumber/PyMuPDF.
+- **Domain**: Processing company regulations from multi-source PDFs into a queryable knowledge base.
+
+# Python & Data Processing Standards
+1. **Memory Efficiency**: Since we handle large PDF batches, prioritize memory-efficient processing. Close file streams promptly.
+2. **Metadata Integrity**: Every text chunk MUST retain its source metadata (filename, page_number, section_header). Do not discard this during indexing.
+3. **FAISS Best Practices**: 
+   - Use 'Inner Product' or 'L2 distance' appropriately based on the embedding model.
+   - Implement persistent storage for indices to avoid re-indexing from scratch.
+4. **Asynchronous Execution**: Use `asyncio` for I/O bound tasks like PDF reading or API embedding calls to improve throughput.
+
+# Mathematical & Logic Modeling
+- **Precision**: When discussing similarity search or embedding dimensions, use precise mathematical terminology (e.g., "Cosine Similarity", "Dense Vectors", "Top-k retrieval").
+- **Mathematical Modeling**: Apply strict logic when fitting data or calculating chunk overlaps to ensure no information loss.
+
+# PDF Parsing Rules
+- **Structure Awareness**: Prioritize maintaining the hierarchy of the original document (Headers, Sub-headers).
+- **Cleaner**: Implement robust cleaning for PDF-specific artifacts (headers/footers, page numbers in text, encoding glitches).
+
+# Error Handling
+- **Robustness**: Wrap PDF parsing and Vector DB connections in try-except blocks. Log errors with specific context for debugging.

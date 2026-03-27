@@ -51,9 +51,10 @@ PROFESSIONAL_SYSTEM_TEMPLATE = """
 {query}
 
 【注意事项】：
-1. 若【已知制度】为空、或与问题无关、不足以作答，请明确说明知识库中未检索到相关条款，并建议咨询对口部门（如 HR），勿编造制度内容。
-2. 回答公司制度问题时，必须优先依据上方片段；片段未覆盖处不要凭常识补全为「公司内部规定」。
-3. 若能依据片段作答，请简要注明出处（文件名与页码，如：参考自《XX制度》第 X 页）。
+1. 仅根据【已知信息】回答。例如:如果信息中没有提到该委员会的特定人数要求，请直说“未找到该委员会的具体人数规定”。
+2. 严禁使用“参考其他委员会”或“根据常识”进行类比推理。
+3. 如果已知信息之间存在冲突，请全部列出并提示差异。
+4. 如果已知信息中提到比例（如三分之二），请根据该比例计算并回答用户关于具体人数（如一半）的问题。
 """
 
 
@@ -82,7 +83,9 @@ _PROCESSED_FILES_JSON = "processed_files.json"
 _METADATA_DEPARTMENT = "company"
 _METADATA_UPDATE_TIME = "2026-03-27"
 # similarity = 1/(1+distance)，非概率；仅作单调标尺。默认仅保留 similarity >= 该值的片段
-_DEFAULT_SIMILARITY_THRESHOLD = 0.5
+_DEFAULT_SIMILARITY_THRESHOLD = 0.3
+# 检索参与上下文的分块条数默认上限（RAG 作答与 similarity_search 一致）
+_DEFAULT_TOP_K = 10
 
 _logger = logging.getLogger(__name__)
 
@@ -329,8 +332,8 @@ def process_text_with_splitter(
     落盘内容（与「单独的 page_info.pkl」区别见下）：
     - ``{index_name}.faiss``：仅向量索引。
     - ``{index_name}.pkl``：序列化的 (docstore, index_to_docstore_id)，其中每条 Document
-      的 ``page_content`` 为正文，``metadata`` 含 source_file、file_hash、department、
-      update_time、page_number、chunk_id 等。
+      的 ``page_content`` 为**嵌入用增强正文**（含「资料来源 / 页码」等前缀 + 原分块正文），
+      ``metadata`` 仍含 source_file、file_hash、department、update_time、page_number、chunk_id 等。
       检索时可直接从返回的 Document 取页码，一般**不必再维护**额外的 page_info.pkl。
 
     「page_info」类文件的作用：在**不用 LangChain 文档对象**、只持有裸 FAISS 索引时，
@@ -343,7 +346,10 @@ def process_text_with_splitter(
     out_dir = Path(save_path) if save_path is not None else _VECTOR_MODEL_PATH
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    texts = [item["content"] for item in all_chunks_data]
+    texts = [
+        _enrich_page_content_for_embedding(item["content"], item["metadata"])
+        for item in all_chunks_data
+    ]
     metadatas = [dict(item["metadata"]) for item in all_chunks_data]
 
     embeddings = get_embeddings()
@@ -392,6 +398,27 @@ def _clean_pdf_extracted_text(text: str) -> str:
     s = _PDF_NL_SURROUND_SPACES_RE.sub("\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
+
+
+def _enrich_page_content_for_embedding(
+    content: str,
+    metadata: dict[str, Any],
+) -> str:
+    """
+    嵌入前拼接可检索的「身份」短语（资料来源、部门、页码等），提升同义不同问法下的召回；
+    向量与 docstore 中存的是增强后全文，metadata 结构不变。
+    """
+    src = metadata.get("source_file") or "未知文件"
+    dept = metadata.get("department")
+    page = metadata.get("page_number")
+    lines: list[str] = [f"资料来源：{src}"]
+    if dept:
+        lines.append(f"所属部门：{dept}")
+    if page is not None:
+        lines.append(f"页码：{page}")
+    head = "\n".join(lines)
+    body = (content or "").strip()
+    return f"{head}\n正文内容：\n{body}"
 
 
 def extract_text_with_page_numbers(pdf) -> List[Tuple[str, int]]:
@@ -605,7 +632,10 @@ def sync_vector_store(
             processed[pdf_name] = h
         if incremental_chunks:
             vs.add_texts(
-                [c["content"] for c in incremental_chunks],
+                [
+                    _enrich_page_content_for_embedding(c["content"], c["metadata"])
+                    for c in incremental_chunks
+                ],
                 metadatas=[c["metadata"] for c in incremental_chunks],
             )
 
@@ -701,7 +731,7 @@ def load_knowledge_base(
 def similarity_search(
     query: str,
     *,
-    k: int = 5,
+    k: int = _DEFAULT_TOP_K,
     vector_db: FAISS | None = None,
     save_dir: str | Path | None = None,
     score_threshold: float | None = _DEFAULT_SIMILARITY_THRESHOLD,
@@ -721,7 +751,7 @@ def similarity_search(
 
     :param k: 至多返回 k 条**通过阈值**的结果
     :param score_threshold: 仅保留 ``similarity >= score_threshold``；``None`` 表示不过滤。
-        默认 ``_DEFAULT_SIMILARITY_THRESHOLD``（0.5）。设阈值时会向 FAISS 多取邻居再过滤，以尽量凑满 k 条。
+        默认 ``_DEFAULT_SIMILARITY_THRESHOLD``。设阈值时会向 FAISS 多取邻居再过滤，以尽量凑满 k 条。
     """
     q = (query or "").strip()
     if not q:
@@ -762,7 +792,7 @@ def similarity_search(
 def search_knowledge_base(
     query: str,
     vector_db: FAISS,
-    top_k: int = 3,
+    top_k: int = _DEFAULT_TOP_K,
     *,
     score_threshold: float | None = _DEFAULT_SIMILARITY_THRESHOLD,
 ) -> list[dict[str, Any]]:
@@ -850,7 +880,7 @@ def chat_answer_text(response: Any) -> str:
 def generate_rag_answer(
     query: str,
     *,
-    top_k: int = 5,
+    top_k: int = _DEFAULT_TOP_K,
     score_threshold: float | None = _DEFAULT_SIMILARITY_THRESHOLD,
     chat_model: str | None = None,
     vector_db: FAISS | None = None,
@@ -922,16 +952,18 @@ def _cli_score_threshold(args: argparse.Namespace) -> float | None:
     return None if args.no_min_score else args.min_score
 
 
-def _add_query_and_retrieval_args(p: argparse.ArgumentParser, *, query_help: str) -> None:
+def _add_query_and_retrieval_args(
+    p: argparse.ArgumentParser, *, query_help: str
+) -> None:
     p.add_argument("query", nargs="+", help=query_help)
     p.add_argument(
         "-k",
         "--top-k",
         type=int,
-        default=5,
+        default=_DEFAULT_TOP_K,
         dest="top_k",
         metavar="N",
-        help="检索片段数上限（默认 5）",
+        help=f"检索片段数上限（默认 {_DEFAULT_TOP_K}）",
     )
     p.add_argument(
         "--min-score",
@@ -1000,7 +1032,9 @@ def _cmd_interactive(_args: argparse.Namespace) -> None:
         if not line or line.lower() in ("exit", "quit", "q"):
             break
         try:
-            out = generate_rag_answer(line, top_k=5, save_dir=_VECTOR_MODEL_PATH)
+            out = generate_rag_answer(
+                line, top_k=_DEFAULT_TOP_K, save_dir=_VECTOR_MODEL_PATH
+            )
         except Exception as e:
             _logger.exception("交互问答失败")
             print(f"错误：{e}\n")
@@ -1022,7 +1056,7 @@ def _cmd_help(args: argparse.Namespace) -> None:
         f"  python {script} help               # 本帮助\n"
         f"  python {script} help search        # 仅看 search 的选项\n"
         f"  python {script} sync               # 同步 PDF → FAISS\n"
-        f"  python {script} search 考勤 -k 3\n"
+        f"  python {script} search 考勤 -k {_DEFAULT_TOP_K}\n"
         f"  python {script} ask 年假怎么休 -v\n"
         "\n环境变量：BAILIAN_API_KEY / DASHSCOPE_API_KEY；"
         f"对话模型 DASHSCOPE_CHAT_MODEL（默认 {CHAT_MODEL!r}）。\n"
@@ -1042,9 +1076,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     )
 
     p_search = sub.add_parser("search", help="仅向量检索，打印制度片段")
-    _add_query_and_retrieval_args(
-        p_search, query_help="关键词或问题（白话）"
-    )
+    _add_query_and_retrieval_args(p_search, query_help="关键词或问题（白话）")
     p_search.set_defaults(handler=_cmd_search)
 
     p_ask = sub.add_parser("ask", help="单次 RAG 问答（非交互）")
