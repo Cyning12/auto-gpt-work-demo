@@ -9,6 +9,7 @@
 # Step6，显示每个文档块的来源页码
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ import requests
 from dotenv import load_dotenv
 
 from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, ConfigDict, Field
@@ -32,8 +34,6 @@ from typing import Any, List, Tuple
 _DASHSCOPE_EMBED_BATCH_SIZE: dict[str, int] = {
     "text-embedding-v1": 25,
     "text-embedding-v2": 25,
-    "text-embedding-v3": 10,
-    "text-embedding-v4": 10,
 }
 
 # 网络抖动 / 代理中断时常见，单批重试，避免整条流水线直接失败
@@ -49,6 +49,11 @@ _RETRYABLE_REQUEST_ERRORS: tuple[type[BaseException], ...] = (
 
 # LangChain FAISS 落盘默认文件名（save_local 生成 index.faiss + index.pkl）
 _FAISS_INDEX_NAME = "index"
+# 记录「文件名 -> 内容 MD5」，用于判断 PDF 是否变更；与向量库同目录持久化
+_PROCESSED_FILES_JSON = "processed_files.json"
+# 部门字段暂写死，后续可从配置或业务接口注入
+_METADATA_DEPARTMENT = "company"
+_METADATA_UPDATE_TIME = "2026-03-27"
 
 _logger = logging.getLogger(__name__)
 
@@ -192,6 +197,94 @@ def vector_bundle_exists(save_dir: str | Path) -> bool:
     )
 
 
+def get_file_hash(file_path: str | Path) -> str:
+    """计算文件 MD5，用于判断源文件是否变更。"""
+    p = Path(file_path)
+    with p.open("rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+
+def _processed_files_path(save_dir: Path) -> Path:
+    return save_dir / _PROCESSED_FILES_JSON
+
+
+def load_processed_files(save_dir: str | Path) -> dict[str, str]:
+    """加载「文件名 -> 文件 MD5」映射；文件不存在时返回空字典。"""
+    p = _processed_files_path(Path(save_dir))
+    if not p.is_file():
+        return {}
+    with p.open(encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def save_processed_files(save_dir: str | Path, mapping: dict[str, str]) -> None:
+    """持久化已处理文件的哈希表。"""
+    save_p = Path(save_dir)
+    save_p.mkdir(parents=True, exist_ok=True)
+    out = _processed_files_path(save_p)
+    with out.open("w", encoding="utf-8") as f:
+        json.dump(mapping, f, ensure_ascii=False, indent=2)
+
+
+def _remove_faiss_bundle(save_dir: Path) -> None:
+    """删除落盘的 FAISS 向量与文档序列化文件（保留同目录下其它文件如 processed_files.json）。"""
+    for suffix in (".faiss", ".pkl"):
+        p = save_dir / f"{_FAISS_INDEX_NAME}{suffix}"
+        if p.is_file():
+            p.unlink()
+
+
+def _faiss_doc_ids_for_source_file(vs: FAISS, source_file: str) -> list[str]:
+    """收集 metadata.source_file 等于给定文件名的文档 id，供增量删除。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for _idx, doc_id in vs.index_to_docstore_id.items():
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        doc = vs.docstore.search(doc_id)
+        if not isinstance(doc, Document):
+            continue
+        if doc.metadata.get("source_file") == source_file:
+            out.append(doc_id)
+    return out
+
+
+def _indexed_source_file_names(vs: FAISS) -> set[str]:
+    """向量库 docstore 中曾出现过的 ``metadata.source_file`` 集合（与目录文件名比对用）。"""
+    seen_doc_ids: set[str] = set()
+    sources: set[str] = set()
+    for doc_id in vs.index_to_docstore_id.values():
+        if doc_id in seen_doc_ids:
+            continue
+        seen_doc_ids.add(doc_id)
+        doc = vs.docstore.search(doc_id)
+        if not isinstance(doc, Document):
+            continue
+        sf = doc.metadata.get("source_file")
+        if sf:
+            sources.add(str(sf))
+    return sources
+
+
+def _chunks_dicts_from_faiss(vs: FAISS) -> list[dict[str, Any]]:
+    """从 FAISS 文档库导出与 read_pdf_files 一致结构的列表，用于写 chunk JSON。"""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for doc_id in vs.index_to_docstore_id.values():
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        doc = vs.docstore.search(doc_id)
+        if not isinstance(doc, Document):
+            continue
+        out.append({"content": doc.page_content, "metadata": dict(doc.metadata)})
+    return out
+
+
 def process_text_with_splitter(
     all_chunks_data: list[dict[str, Any]],
     save_path: str | Path | None = None,
@@ -204,7 +297,8 @@ def process_text_with_splitter(
     落盘内容（与「单独的 page_info.pkl」区别见下）：
     - ``{index_name}.faiss``：仅向量索引。
     - ``{index_name}.pkl``：序列化的 (docstore, index_to_docstore_id)，其中每条 Document
-      的 ``page_content`` 为正文，``metadata`` 含 source_file、page_number、chunk_id 等。
+      的 ``page_content`` 为正文，``metadata`` 含 source_file、file_hash、department、
+      update_time、page_number、chunk_id 等。
       检索时可直接从返回的 Document 取页码，一般**不必再维护**额外的 page_info.pkl。
 
     「page_info」类文件的作用：在**不用 LangChain 文档对象**、只持有裸 FAISS 索引时，
@@ -271,51 +365,198 @@ def read_pdf(pdf_path: Path) -> PdfReader:
     return PdfReader(pdf_path)
 
 
+def _build_chunks_for_pdf(
+    pdf_full: Path,
+    pdf_name: str,
+    doc_idx: int,
+    file_hash: str,
+    splitter: RecursiveCharacterTextSplitter,
+) -> list[dict[str, Any]]:
+    """单个 PDF 分块；metadata 含 file_hash、department、update_time。"""
+    pdf = read_pdf(pdf_full)
+    per_page = extract_text_with_page_numbers(pdf)
+
+    char_total = sum(len(t) for t, _ in per_page)
+    print(
+        f"读取文件：{pdf_name}，页数（有文本）：{len(per_page)}，约 {char_total} 字符"
+    )
+
+    rows: list[dict[str, Any]] = []
+    chunk_in_doc = 0
+    for page_text, page_number in per_page:
+        for chunk in splitter.split_text(page_text):
+            chunk_in_doc += 1
+            rows.append(
+                {
+                    "content": chunk,
+                    "metadata": {
+                        "source_file": pdf_name,
+                        "page_number": page_number,
+                        "chunk_id": f"doc_{doc_idx:02d}_ch_{chunk_in_doc}",
+                        "file_hash": file_hash,
+                        "department": _METADATA_DEPARTMENT,
+                        "update_time": _METADATA_UPDATE_TIME,
+                    },
+                }
+            )
+    return rows
+
+
 def read_pdf_files(
     folder: str | Path,
     *,
     chunk_size: int = 500,
     chunk_overlap: int = 80,
+    processed_files: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """遍历同一目录下 PDF，按页提取文本后分块，整理为待向量化数据结构。"""
+    """
+    遍历同一目录下 PDF，按页提取文本后分块。
+
+    若传入 ``processed_files``（文件名 -> 上次入库时的 MD5），则与当前文件哈希比对：
+    一致则跳过该文件；变更或新文件则重新分块并带上最新 metadata。
+    """
     folder_path = Path(folder)
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
-    all_chunks_data: list[dict[str, Any]] = []
+    proc = processed_files if processed_files is not None else {}
 
     names = [
         n
         for n in list_files_in_directory(folder_path)
         if Path(n).suffix.lower() == ".pdf"
     ]
+    all_chunks_data: list[dict[str, Any]] = []
     for doc_idx, pdf_name in enumerate(names, start=1):
         pdf_full = folder_path / pdf_name
-        pdf = read_pdf(pdf_full)
-        per_page = extract_text_with_page_numbers(pdf)
-
-        char_total = sum(len(t) for t, _ in per_page)
-        print(
-            f"读取文件：{pdf_name}，页数（有文本）：{len(per_page)}，约 {char_total} 字符"
+        current_hash = get_file_hash(pdf_full)
+        if proc.get(pdf_name) == current_hash:
+            print(f"跳过已存在的文件: {pdf_name}")
+            continue
+        all_chunks_data.extend(
+            _build_chunks_for_pdf(pdf_full, pdf_name, doc_idx, current_hash, splitter)
         )
 
-        chunk_in_doc = 0
-        for page_text, page_number in per_page:
-            for chunk in splitter.split_text(page_text):
-                chunk_in_doc += 1
-                all_chunks_data.append(
-                    {
-                        "content": chunk,
-                        "metadata": {
-                            "source_file": pdf_name,
-                            "page_number": page_number,
-                            "chunk_id": f"doc_{doc_idx:02d}_ch_{chunk_in_doc}",
-                        },
-                    }
-                )
-
     return all_chunks_data
+
+
+def sync_vector_store(
+    source_folder: str | Path | None = None,
+    save_dir: str | Path | None = None,
+) -> FAISS | None:
+    """
+    每次运行全量扫描源目录并比对 ``processed_files.json``（文件名 -> MD5），但 **Embedding 只对变动文件做**：
+
+    - **冷启动**（目录下尚无 ``index.faiss``）：才会把所有 PDF 分块后一次性 ``FAISS.from_texts``（经 ``process_text_with_splitter``）。
+    - **增量**（索引已存在且仅有部分文件新增/变更）：对每个待更新文件先按 ``source_file`` 从索引中 ``delete`` 旧向量，再 **仅将变动文件的分块** 合并后调用 **一次** ``add_texts``；未变更文件既不读 PDF 也不调用嵌入接口。
+    - **清理**：源目录中已删除的 PDF，若仍出现在向量库 metadata 的 ``source_file`` 中，会按文件名找到 docstore id 并 ``delete``（不依赖 ``processed_files.json`` 是否仍记着该文件，避免残留）。
+
+    说明：不能仅用 docstore 里 ``file_hash`` 的集合判断「跳过」——文件内容从 A 变到 B 时，旧块仍带着哈希 A，
+    若不做按文件删除，会出现同一路径下新旧版本向量并存。因此用 ``processed_files.json`` 按 **文件名** 绑定当前应入库的 MD5，
+    与「按 source_file 删旧再写入」配套使用。
+    """
+    folder_path = Path(source_folder if source_folder is not None else _FILES_PATH)
+    target = Path(save_dir if save_dir is not None else _VECTOR_MODEL_PATH)
+    target.mkdir(parents=True, exist_ok=True)
+
+    names = [
+        n
+        for n in list_files_in_directory(folder_path)
+        if Path(n).suffix.lower() == ".pdf"
+    ]
+    current_hashes = {n: get_file_hash(folder_path / n) for n in names}
+    processed = load_processed_files(target)
+
+    # 旧向量库无 processed 记录时无法可靠做增量对齐，全量重建
+    if vector_bundle_exists(target) and not _processed_files_path(target).is_file():
+        _logger.warning(
+            "检测到向量库存在但未找到 %s，将删除旧索引并全量重建（与 file_hash 等元数据对齐）",
+            _PROCESSED_FILES_JSON,
+        )
+        _remove_faiss_bundle(target)
+        processed = {}
+
+    to_refresh = [n for n in names if processed.get(n) != current_hashes[n]]
+
+    if not vector_bundle_exists(target):
+        # 仅冷启动：全量分块 + 一次性建索引（会嵌入全部 PDF）
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=80,
+        )
+        chunks: list[dict[str, Any]] = []
+        for doc_idx, pdf_name in enumerate(names, start=1):
+            pdf_full = folder_path / pdf_name
+            h = current_hashes[pdf_name]
+            chunks.extend(
+                _build_chunks_for_pdf(pdf_full, pdf_name, doc_idx, h, splitter)
+            )
+        if not chunks:
+            print("无 PDF 分块，跳过建库")
+            return None
+        save_processed_files(target, {n: current_hashes[n] for n in names})
+        save_pdf_chunks_json(chunks, save_dir=target)
+        return process_text_with_splitter(chunks, target)
+
+    names_set = set(names)
+    embeddings = get_embeddings()
+    vs = FAISS.load_local(
+        str(target),
+        embeddings,
+        index_name=_FAISS_INDEX_NAME,
+        allow_dangerous_deserialization=True,
+    )
+
+    indexed_sources = _indexed_source_file_names(vs)
+    # 源目录已不存在，但向量库仍带该 source_file 的分块（含 processed 未记录的旧数据）
+    orphan_sources = sorted(indexed_sources - names_set)
+
+    for k in list(processed.keys()):
+        if k not in names_set:
+            processed.pop(k, None)
+
+    if not to_refresh and not orphan_sources:
+        save_processed_files(target, processed)
+        print("所有 PDF 与已处理记录一致，跳过向量库更新")
+        return None
+
+    if orphan_sources:
+        for pdf_name in orphan_sources:
+            ids = _faiss_doc_ids_for_source_file(vs, pdf_name)
+            if ids:
+                vs.delete(ids)
+            print(f"已清理源目录已删除文件对应向量: {pdf_name}")
+
+    if to_refresh:
+        # 增量：先按文件删掉旧向量，再只对变动文件解析 PDF；嵌入仅针对本批 new_chunks（一次 add_texts）
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=80,
+        )
+        incremental_chunks: list[dict[str, Any]] = []
+        for pdf_name in to_refresh:
+            ids = _faiss_doc_ids_for_source_file(vs, pdf_name)
+            if ids:
+                vs.delete(ids)
+            doc_idx = names.index(pdf_name) + 1
+            pdf_full = folder_path / pdf_name
+            h = current_hashes[pdf_name]
+            incremental_chunks.extend(
+                _build_chunks_for_pdf(pdf_full, pdf_name, doc_idx, h, splitter)
+            )
+            processed[pdf_name] = h
+        if incremental_chunks:
+            vs.add_texts(
+                [c["content"] for c in incremental_chunks],
+                metadatas=[c["metadata"] for c in incremental_chunks],
+            )
+
+    save_processed_files(target, processed)
+    vs.save_local(str(target), index_name=_FAISS_INDEX_NAME)
+    save_pdf_chunks_json(_chunks_dicts_from_faiss(vs), save_dir=target)
+    print("向量库已按文件哈希校验并完成更新")
+    return vs
 
 
 def save_pdf_chunks_json(
@@ -345,15 +586,20 @@ def create_vector_model(
     *,
     save_dir: Path | None = None,
 ) -> FAISS | None:
-    """若向量目录已存在则跳过；否则从 PDF 读取分块并建库。"""
+    """
+    默认走 ``sync_vector_store``：每次按 MD5 检查源 PDF，变更则更新向量库。
+    若显式传入 ``chunks``，仅在向量库尚不存在时写入（与历史行为一致）。
+    """
     target = save_dir if save_dir is not None else _VECTOR_MODEL_PATH
-    if vector_bundle_exists(target):
-        print("向量模型已存在")
-        return None
-    data = chunks if chunks is not None else read_pdf_files(_FILES_PATH)
-    print("向量模型不存在，创建向量模型")
-    save_pdf_chunks_json(data, save_dir=target)
-    return process_text_with_splitter(data, target)
+    if chunks is not None:
+        if vector_bundle_exists(target):
+            print("向量模型已存在")
+            return None
+        print("向量模型不存在，使用传入分块创建向量模型")
+        target.mkdir(parents=True, exist_ok=True)
+        save_pdf_chunks_json(chunks, save_dir=target)
+        return process_text_with_splitter(chunks, target)
+    return sync_vector_store(source_folder=_FILES_PATH, save_dir=target)
 
 
 # text, page_numbers = extract_text_with_page_numbers(
@@ -371,13 +617,7 @@ def create_vector_model(
 
 
 def main() -> None:
-    if vector_bundle_exists(_VECTOR_MODEL_PATH):
-        print("向量模型已存在")
-        return
-    chunks = read_pdf_files(_FILES_PATH)
-    print("向量模型不存在，创建向量模型")
-    save_pdf_chunks_json(chunks, save_dir=_VECTOR_MODEL_PATH)
-    process_text_with_splitter(chunks, _VECTOR_MODEL_PATH)
+    sync_vector_store(source_folder=_FILES_PATH, save_dir=_VECTOR_MODEL_PATH)
 
 
 if __name__ == "__main__":
