@@ -230,3 +230,19 @@ def prompt_back_or_exit() -> None:
         if cmd == "back":
             return
         print("无效输入，请输入 back 或 exit")
+
+        # INSERT_YOUR_CODE
+
+
+def list_files_in_directory(folder: str | Path) -> list[str]:
+    """
+    返回目标文件夹下所有非隐藏、非目录的文件名列表（不含子目录）。
+    """
+    p = Path(folder)
+    if not p.is_dir():
+        raise FileNotFoundError(f"目录不存在: {folder}")
+    return [
+        f.name
+        for f in sorted(p.iterdir())
+        if f.is_file() and not f.name.startswith(".")
+    ]
