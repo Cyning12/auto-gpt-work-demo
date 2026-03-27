@@ -7,6 +7,7 @@
 # Step4，执行相似度搜索，找到与查询相关的文档
 # Step5，使用问到链对用户问题进行回答 （使用你的DASHSCOPE_API_KEY）
 # Step6，显示每个文档块的来源页码
+# 直接运行本脚本：进入终端交互问答；子命令 sync / search / ask 见 --help
 from __future__ import annotations
 
 import os
@@ -35,6 +36,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, ConfigDict, Field
 
+from http import HTTPStatus
 from typing import Any, List, Tuple
 
 PROFESSIONAL_SYSTEM_TEMPLATE = """
@@ -49,9 +51,9 @@ PROFESSIONAL_SYSTEM_TEMPLATE = """
 {query}
 
 【注意事项】：
-1. 如果提供的【已知制度】中没有关于“请假”、“假种”、“申请流程”的具体说明，请直接回答：“抱歉，目前的规章制度库中未包含员工请假相关的具体申请流程，建议咨询 HR 部门。”
-2. 严禁根据你自身的知识储备来回答公司制度，只能依据上方提供的片段。
-3. 如果能够回答，请务必注明出处（如：参考自《XX制度》第X页）。
+1. 若【已知制度】为空、或与问题无关、不足以作答，请明确说明知识库中未检索到相关条款，并建议咨询对口部门（如 HR），勿编造制度内容。
+2. 回答公司制度问题时，必须优先依据上方片段；片段未覆盖处不要凭常识补全为「公司内部规定」。
+3. 若能依据片段作答，请简要注明出处（文件名与页码，如：参考自《XX制度》第 X 页）。
 """
 
 
@@ -120,7 +122,8 @@ def _log_embedding_failure_hint(exc: BaseException) -> None:
 _practice_root = Path(__file__).resolve().parents[1]
 if str(_practice_root) not in sys.path:
     sys.path.insert(0, str(_practice_root))
-from utils import list_files_in_directory
+from dashscope_generation import call_generation
+from utils import generation_first_message, list_files_in_directory
 
 # 课程练习根目录（…/data/课程练习）
 _PRACTICE_ROOT = Path(__file__).resolve().parent.parent
@@ -138,6 +141,8 @@ if not _api_key:
         "未配置 API Key：请在环境变量或本目录 .env 中设置 BAILIAN_API_KEY 或 DASHSCOPE_API_KEY"
     )
 EMBEDDING_MODEL = "text-embedding-v2"
+# 通用对话模型（RAG 生成阶段）；可通过环境变量覆盖，例如 deepseek-v3、qwen-plus
+CHAT_MODEL = "qwen-turbo".strip()
 
 
 class DashScopeEmbeddingsSafe(BaseModel, Embeddings):
@@ -775,6 +780,123 @@ def search_knowledge_base(
     )
 
 
+def _format_rag_context(hits: list[dict[str, Any]]) -> str:
+    """将检索分块拼成注入大模型的上下文。"""
+    if not hits:
+        return "（未检索到达到相似度阈值的制度片段。）"
+    parts: list[str] = []
+    for i, h in enumerate(hits, start=1):
+        src = h.get("source_file") or "未知文件"
+        page = h.get("page_number")
+        sim = h.get("similarity")
+        if page is not None:
+            head = f"[{i}] 《{src}》第 {page} 页"
+        else:
+            head = f"[{i}] 《{src}》"
+        if sim is not None:
+            head += f"（similarity≈{sim:.3f}）"
+        parts.append(f"{head}\n{h.get('content', '').strip()}")
+    return "\n\n---\n\n".join(parts)
+
+
+def build_rag_prompt_text(query: str, hits: list[dict[str, Any]]) -> str:
+    """拼装完整系统提示（含制度上下文与用户问题）。"""
+    return PROFESSIONAL_SYSTEM_TEMPLATE.format(
+        context=_format_rag_context(hits),
+        query=(query or "").strip(),
+    )
+
+
+def call_dashscope_chat(
+    messages: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+) -> Any:
+    """调用 DashScope 文本生成（通用对话模型），与向量嵌入模型相互独立。"""
+    return call_generation(
+        model or CHAT_MODEL,
+        messages,
+        api_key=_api_key,
+    )
+
+
+def get_model(model_name: str, prompt: str, messages: list[dict[str, Any]]) -> Any:
+    """兼容练习脚本签名；使用本模块已校验的 ``_api_key`` 调用 ``dashscope_generation``。"""
+    return call_generation(
+        model_name,
+        messages,
+        api_key=_api_key,
+        prompt=prompt or None,
+    )
+
+
+def chat_answer_text(response: Any) -> str:
+    """从 Generation 响应中取出 assistant 文本。"""
+    msg = generation_first_message(response)
+    if msg is None:
+        code = getattr(response, "status_code", None)
+        msg_err = getattr(response, "message", None)
+        raise RuntimeError(
+            f"DashScope 对话无有效回复：status_code={code!r}, message={msg_err!r}"
+        )
+    content = (
+        msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+    )
+    if not content:
+        raise RuntimeError("DashScope 返回的 assistant message 无 content")
+    return str(content).strip()
+
+
+def generate_rag_answer(
+    query: str,
+    *,
+    top_k: int = 5,
+    score_threshold: float | None = _DEFAULT_SIMILARITY_THRESHOLD,
+    chat_model: str | None = None,
+    vector_db: FAISS | None = None,
+    save_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """
+    RAG 问答（Step5）：先用本地 FAISS 检索制度片段，再调用通用对话模型（默认 ``CHAT_MODEL``）生成回答。
+
+    - **向量模型**：仅负责 ``similarity_search`` 中的 ``embed_query`` / 索引距离。
+    - **通用模型**：负责阅读理解片段并组织自然语言答案（可通过环境变量 ``DASHSCOPE_CHAT_MODEL`` 指定）。
+
+    返回 ``answer``、``model``、``retrieval``（检索分块列表）、``context``（拼好的片段正文）。
+    """
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("query 不能为空")
+
+    hits = similarity_search(
+        q,
+        k=top_k,
+        vector_db=vector_db,
+        save_dir=save_dir,
+        score_threshold=score_threshold,
+    )
+    system_text = build_rag_prompt_text(q, hits)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": q},
+    ]
+    resp = call_dashscope_chat(messages, model=chat_model)
+    if getattr(resp, "status_code", None) != HTTPStatus.OK:
+        code = getattr(resp, "code", None)
+        message = getattr(resp, "message", None)
+        raise RuntimeError(
+            f"DashScope 对话失败：status_code={getattr(resp, 'status_code', None)!r}, "
+            f"code={code!r}, message={message!r}"
+        )
+    answer = chat_answer_text(resp)
+    return {
+        "answer": answer,
+        "model": chat_model or CHAT_MODEL,
+        "retrieval": hits,
+        "context": _format_rag_context(hits),
+    }
+
+
 def _print_similarity_results(results: list[dict[str, Any]]) -> None:
     """CLI 下打印检索结果（简体中文）。"""
     if not results:
@@ -795,71 +917,177 @@ def _print_similarity_results(results: list[dict[str, Any]]) -> None:
         print(row.get("content", "").strip())
 
 
-def _cmd_sync(_args: argparse.Namespace) -> None:
-    sync_vector_store(source_folder=_FILES_PATH, save_dir=_VECTOR_MODEL_PATH)
+def _cli_score_threshold(args: argparse.Namespace) -> float | None:
+    """命令行：是否启用 similarity 下限。"""
+    return None if args.no_min_score else args.min_score
 
 
-def _cmd_search(args: argparse.Namespace) -> None:
-    query = " ".join(args.query).strip()
-    thr: float | None = None if args.no_min_score else args.min_score
-    results = similarity_search(
-        query,
-        k=args.top_k,
-        save_dir=_VECTOR_MODEL_PATH,
-        score_threshold=thr,
-    )
-    _print_similarity_results(results)
-
-
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(
-        description="制度 RAG：同步 PDF 向量库（sync）或白话相似度检索（search）",
-    )
-    sub = parser.add_subparsers(dest="cmd", required=False)
-
-    p_sync = sub.add_parser("sync", help="扫描 PDF、按 MD5 增量更新 FAISS")
-    p_sync.set_defaults(handler=_cmd_sync)
-
-    p_search = sub.add_parser(
-        "search",
-        help="将白话转为向量，在 FAISS 中检索最相关的制度分块",
-    )
-    p_search.add_argument(
-        "query",
-        nargs="+",
-        help="用户问题或关键词（白话）",
-    )
-    p_search.add_argument(
+def _add_query_and_retrieval_args(p: argparse.ArgumentParser, *, query_help: str) -> None:
+    p.add_argument("query", nargs="+", help=query_help)
+    p.add_argument(
         "-k",
         "--top-k",
         type=int,
         default=5,
         dest="top_k",
         metavar="N",
-        help="最多返回 N 条分块（默认 5）",
+        help="检索片段数上限（默认 5）",
     )
-    p_search.add_argument(
+    p.add_argument(
         "--min-score",
         type=float,
         default=_DEFAULT_SIMILARITY_THRESHOLD,
         metavar="S",
         help=(
-            f"仅保留 similarity(=1/(1+距离)) >= S，默认 {_DEFAULT_SIMILARITY_THRESHOLD}；"
+            f"similarity(=1/(1+距离)) 下限，默认 {_DEFAULT_SIMILARITY_THRESHOLD}；"
             "越大越严"
         ),
     )
-    p_search.add_argument(
+    p.add_argument(
         "--no-min-score",
         action="store_true",
-        help="取消相似度下限，返回距离最近的 top-k 条（调试/对比用）",
+        help="取消 similarity 下限（调试用）",
+    )
+
+
+def _cmd_sync(_args: argparse.Namespace) -> None:
+    sync_vector_store(source_folder=_FILES_PATH, save_dir=_VECTOR_MODEL_PATH)
+
+
+def _cmd_search(args: argparse.Namespace) -> None:
+    query = " ".join(args.query).strip()
+    results = similarity_search(
+        query,
+        k=args.top_k,
+        save_dir=_VECTOR_MODEL_PATH,
+        score_threshold=_cli_score_threshold(args),
+    )
+    _print_similarity_results(results)
+
+
+def _cmd_ask(args: argparse.Namespace) -> None:
+    query = " ".join(args.query).strip()
+    out = generate_rag_answer(
+        query,
+        top_k=args.top_k,
+        score_threshold=_cli_score_threshold(args),
+        save_dir=_VECTOR_MODEL_PATH,
+        chat_model=args.chat_model or None,
+    )
+    print(f"[模型: {out['model']}]\n")
+    print(out["answer"])
+    if args.verbose:
+        print("\n---------- 检索到的片段摘要 ----------")
+        for i, h in enumerate(out["retrieval"], start=1):
+            src = h.get("source_file") or "?"
+            page = h.get("page_number")
+            sim = h.get("similarity")
+            print(f"  {i}. {src} p.{page} sim={sim}")
+
+
+def _cmd_interactive(_args: argparse.Namespace) -> None:
+    """无子命令：终端循环输入问题，RAG 作答。"""
+    print(
+        "制度 RAG 交互问答（直接回车，或输入 exit / quit / q 结束）\n"
+        f"对话模型：{CHAT_MODEL}；更新知识库请另开终端执行：python {Path(__file__).name} sync\n"
+    )
+    while True:
+        try:
+            line = input("请输入问题 > ").strip()
+        except EOFError:
+            print()
+            break
+        if not line or line.lower() in ("exit", "quit", "q"):
+            break
+        try:
+            out = generate_rag_answer(line, top_k=5, save_dir=_VECTOR_MODEL_PATH)
+        except Exception as e:
+            _logger.exception("交互问答失败")
+            print(f"错误：{e}\n")
+            continue
+        print(f"\n[模型: {out['model']}]\n{out['answer']}\n")
+
+
+def _cmd_help(args: argparse.Namespace) -> None:
+    """打印总帮助或某一子命令的帮助（与 ``<子命令> -h`` 等价）。"""
+    parser = _build_cli_parser()
+    if args.help_topic:
+        parser.parse_args([args.help_topic, "-h"])
+        return
+    parser.print_help()
+    script = Path(__file__).name
+    print(
+        "\n常用示例：\n"
+        f"  python {script}                    # 交互 RAG 问答（默认）\n"
+        f"  python {script} help               # 本帮助\n"
+        f"  python {script} help search        # 仅看 search 的选项\n"
+        f"  python {script} sync               # 同步 PDF → FAISS\n"
+        f"  python {script} search 考勤 -k 3\n"
+        f"  python {script} ask 年假怎么休 -v\n"
+        "\n环境变量：BAILIAN_API_KEY / DASHSCOPE_API_KEY；"
+        f"对话模型 DASHSCOPE_CHAT_MODEL（默认 {CHAT_MODEL!r}）。\n"
+    )
+
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "默认：交互式 RAG 问答。子命令：sync / search / ask / help（或传 -h）。"
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=False)
+
+    sub.add_parser("sync", help="扫描 PDF、按 MD5 增量更新 FAISS").set_defaults(
+        handler=_cmd_sync
+    )
+
+    p_search = sub.add_parser("search", help="仅向量检索，打印制度片段")
+    _add_query_and_retrieval_args(
+        p_search, query_help="关键词或问题（白话）"
     )
     p_search.set_defaults(handler=_cmd_search)
 
+    p_ask = sub.add_parser("ask", help="单次 RAG 问答（非交互）")
+    _add_query_and_retrieval_args(p_ask, query_help="用户问题（白话）")
+    p_ask.add_argument(
+        "--chat-model",
+        type=str,
+        default="",
+        metavar="NAME",
+        help=f"覆盖对话模型（默认 {CHAT_MODEL!r} 或环境变量）",
+    )
+    p_ask.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="打印检索片段摘要",
+    )
+    p_ask.set_defaults(handler=_cmd_ask)
+
+    p_help = sub.add_parser(
+        "help",
+        help="显示用法说明；help <子命令> 等同于 <子命令> --help",
+    )
+    p_help.add_argument(
+        "help_topic",
+        nargs="?",
+        default=None,
+        metavar="子命令",
+        choices=("sync", "search", "ask"),
+        help="可选：sync / search / ask",
+    )
+    p_help.set_defaults(handler=_cmd_help)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = _build_cli_parser()
     args = parser.parse_args(argv)
     if getattr(args, "handler", None) is not None:
         args.handler(args)
         return
-    _cmd_sync(args)
+    _cmd_interactive(args)
 
 
 if __name__ == "__main__":

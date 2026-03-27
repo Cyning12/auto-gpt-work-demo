@@ -15,6 +15,7 @@ from collections.abc import Mapping
 _practice_root = Path(__file__).resolve().parents[1]
 if str(_practice_root) not in sys.path:
     sys.path.insert(0, str(_practice_root))
+from dashscope_generation import get_model
 from utils import (
     append_practice_jsonl_line,
     generation_first_message,
@@ -33,16 +34,6 @@ dashscope.api_key = api_key or None
 
 # 覆盖 SDK 启动时从环境读到的 base（修复空字符串 / 错填其它厂商 URL）
 # dashscope.base_http_api_url = _resolve_dashscope_http_base()
-
-
-def get_model(model_name: str, prompt: str, messages: list[dict]):
-    response = dashscope.Generation.call(
-        model=model_name,
-        prompt=prompt,
-        messages=messages,
-        result_format="message",
-    )
-    return response
 
 
 # case1:
