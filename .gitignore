@@ -174,3 +174,6 @@ cython_debug/
 # 课程练习本地运行日志（含 API 轨迹，不纳入版本库）
 data/课程练习/**/log/*.jsonl
 
+# gensim Word2Vec 拆出的 .npy 单文件约 56MB，超 GitHub 建议；本地训练/加载后可再生成
+data/课程练习/vectorModels/three_kingdoms/*.npy
+
