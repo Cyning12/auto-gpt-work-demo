@@ -18,6 +18,7 @@ from pathlib import Path
 from disney_file_utils import (
     classify_disney_knowledge_files,
     export_doc_and_docx_to_markdown,
+    image_to_text,
 )
 
 # 课程练习根目录（.../data/课程练习）
@@ -39,3 +40,6 @@ if __name__ == "__main__":
     classified = classify_disney_knowledge_files(_DISNEY_KNOWLEDGE_BASE)
     _print_classification_summary(classified)
     export_doc_and_docx_to_markdown(classified, _DISNEY_KNOWLEDGE_BASE, _PARSED_MD_DIR)
+    for image_path in classified["images"]:
+        result = image_to_text(str(_DISNEY_KNOWLEDGE_BASE / image_path))
+        print(result)

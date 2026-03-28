@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+from PIL import Image
+import pytesseract
 
 # 课程练习根目录（.../data/课程练习）
 _PRACTICE_ROOT = Path(__file__).resolve().parent.parent
@@ -219,3 +221,15 @@ def export_doc_and_docx_to_markdown(
     print(f"\nWord 解析完成：成功 {ok_count}，失败 {fail_count}")
     print(f"Markdown 输出目录：{out_dir}")
     return failed_paths
+
+
+def image_to_text(image_path):
+    """对图片进行OCR和CLIP描述。"""
+    try:
+        image = Image.open(image_path)
+        # OCR
+        ocr_text = pytesseract.image_to_string(image, lang="chi_sim+eng").strip()
+        return {"ocr": ocr_text}
+    except Exception as e:
+        print(f"处理图片失败 {image_path}: {e}")
+        return {"ocr": ""}
