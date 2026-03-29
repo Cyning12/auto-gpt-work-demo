@@ -133,3 +133,32 @@ def get_model(model_name: str, prompt: str, messages: list[dict[str, Any]]) -> A
         messages,
         prompt=prompt if prompt else None,
     )
+
+
+def call_dashscope_chat(
+    messages: list[dict[str, Any]],
+    *,
+    model: str,
+    api_key: str | None = None,
+) -> Any:
+    """OpenAI 风格 ``messages`` 对话；与嵌入 / 精排模型相互独立。"""
+    return call_generation(model, messages, api_key=api_key)
+
+
+def chat_answer_text(response: Any) -> str:
+    """从 Generation 响应中取出 assistant 文本；无有效内容时抛 ``RuntimeError``。"""
+    from utils import generation_first_message
+
+    msg = generation_first_message(response)
+    if msg is None:
+        code = getattr(response, "status_code", None)
+        msg_err = getattr(response, "message", None)
+        raise RuntimeError(
+            f"DashScope 对话无有效回复：status_code={code!r}, message={msg_err!r}"
+        )
+    content = (
+        msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+    )
+    if not content:
+        raise RuntimeError("DashScope 返回的 assistant message 无 content")
+    return str(content).strip()

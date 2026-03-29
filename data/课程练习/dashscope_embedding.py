@@ -3,6 +3,7 @@ DashScope 文本嵌入（TextEmbedding）统一入口，供各课程练习脚本
 
 与 ``dashscope_generation.py`` 一致：封装 ``dashscope.TextEmbedding.call``、网络退避重试，
 并提供 LangChain ``Embeddings`` 适配实现 ``DashScopeEmbeddingsSafe``。
+同目录另有 ``dashscope_rerank.py``（``TextReRank`` 精排与重试）。
 
 使用前将 ``data/课程练习`` 加入 ``sys.path`` 后：
 
@@ -159,6 +160,31 @@ class DashScopeEmbeddingsSafe(BaseModel, Embeddings):
         resp = self._call_embedding(text, text_type="query")
         self._raise_if_bad(resp, context="DashScope embed_query 失败")
         return resp.output["embeddings"][0]["embedding"]
+
+
+def log_embedding_failure_hint(
+    exc: BaseException,
+    *,
+    logger: logging.Logger | None = None,
+) -> None:
+    """向量化失败时补充典型原因说明（KeyError request / SSL 等），便于排查。"""
+    log = logger or _logger
+    if isinstance(exc, KeyError) and exc.args == ("request",):
+        log.error(
+            "提示：上述 KeyError('request') 多见于 DashScope 返回非 200 时，"
+            "langchain_community 用 requests.HTTPError 包装了 DashScope 的响应对象，"
+            "初始化 HTTPError 时访问 .request 失败，真正的 status_code/message 未展示。"
+            "请检查：代理/网络、API Key、embedding 额度与限流；"
+            "text-embedding-v3 单批上限 10 条（本库内已分批，若仍失败可看控制台原始返回）。"
+        )
+    elif isinstance(exc, RETRYABLE_EMBEDDING_ERRORS) or (
+        isinstance(exc, OSError) and "SSL" in type(exc).__name__
+    ):
+        log.error(
+            "提示：SSL/连接类错误常见于公司代理、VPN、防火墙截断 HTTPS，或本机证书链异常。"
+            "可尝试：换网络、检查 HTTPS_PROXY/NO_PROXY、暂时关闭抓包代理；"
+            "仍失败时在终端用 curl -v https://dashscope.aliyuncs.com 做连通性对比。"
+        )
 
 
 def get_dashscope_embeddings(

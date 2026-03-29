@@ -22,6 +22,8 @@ from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from PyPDF2 import PdfReader
 
+from constants import DEFAULT_RAG_SIMILARITY_THRESHOLD, DEFAULT_RAG_TOP_K
+from dashscope_rerank import rerank_retrieval_hits
 from utils import list_files_in_directory
 
 _logger = logging.getLogger(__name__)
@@ -603,4 +605,97 @@ def load_faiss_vector_store(
         embeddings,
         index_name=index_name,
         allow_dangerous_deserialization=True,
+    )
+
+
+def faiss_l2_distance_to_similarity(distance: float) -> float:
+    """
+    将 FAISS ``IndexFlatL2`` 返回的距离转为单调相似度 ``(0, 1]``（``1/(1+d)``，越大越近）。
+    适用于未做 L2 单位化的嵌入（如常见 DashScope text-embedding），避免 ``1-d/√2`` 出现负数。
+    """
+    d = float(distance)
+    if d < 0:
+        d = 0.0
+    return 1.0 / (1.0 + d)
+
+
+def faiss_similarity_search(
+    query: str,
+    *,
+    vector_db: FAISS | None = None,
+    embeddings: Embeddings | None = None,
+    save_dir: str | Path | None = None,
+    index_name: str = FAISS_INDEX_NAME,
+    k: int = DEFAULT_RAG_TOP_K,
+    score_threshold: float | None = DEFAULT_RAG_SIMILARITY_THRESHOLD,
+    rerank: bool = False,
+    api_key_for_rerank: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    向量检索：``query`` 经 ``embed_query`` 后在 FAISS 中取 Top-K，可选 similarity 阈值过滤与 DashScope 精排。
+
+    - 若未传 ``vector_db``，需同时提供 ``embeddings`` 与 ``save_dir``，内部 ``load_faiss_vector_store``。
+    - 返回字典列表，字段含 ``content``、``distance``、``similarity``、``source_file``、``page_number`` 等。
+    """
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("query 不能为空")
+
+    db = vector_db
+    if db is None:
+        if embeddings is None or save_dir is None:
+            raise ValueError("未提供 vector_db 时，必须同时提供 embeddings 与 save_dir")
+        db = load_faiss_vector_store(save_dir, embeddings, index_name=index_name)
+
+    fetch_n = k
+    if score_threshold is not None:
+        fetch_n = min(300, max(k * 20, 80))
+
+    pairs = db.similarity_search_with_score(q, k=fetch_n)
+    rows: list[dict[str, Any]] = []
+    for doc, dist in pairs:
+        similarity = faiss_l2_distance_to_similarity(dist)
+        if score_threshold is not None and similarity < score_threshold:
+            continue
+        meta = dict(doc.metadata)
+        rows.append(
+            {
+                "content": doc.page_content,
+                "distance": float(dist),
+                "similarity": similarity,
+                "relevance_score": similarity,
+                "source_file": meta.get("source_file"),
+                "page_number": meta.get("page_number"),
+                "chunk_id": meta.get("chunk_id"),
+                "file_hash": meta.get("file_hash"),
+                "department": meta.get("department"),
+                "update_time": meta.get("update_time"),
+            }
+        )
+        if len(rows) >= k:
+            break
+    if rerank and rows:
+        rows = rerank_retrieval_hits(
+            q, rows, top_n=len(rows), api_key=api_key_for_rerank
+        )
+    return rows
+
+
+def faiss_search_knowledge_base(
+    query: str,
+    vector_db: FAISS,
+    top_k: int = DEFAULT_RAG_TOP_K,
+    *,
+    score_threshold: float | None = DEFAULT_RAG_SIMILARITY_THRESHOLD,
+    rerank: bool = False,
+    api_key_for_rerank: str | None = None,
+) -> list[dict[str, Any]]:
+    """在已加载的 ``vector_db`` 上检索，避免重复 ``load_local``；语义同 ``faiss_similarity_search(..., vector_db=...)``。"""
+    return faiss_similarity_search(
+        query,
+        vector_db=vector_db,
+        k=top_k,
+        score_threshold=score_threshold,
+        rerank=rerank,
+        api_key_for_rerank=api_key_for_rerank,
     )

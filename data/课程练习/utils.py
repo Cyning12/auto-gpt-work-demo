@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -10,6 +11,13 @@ from collections.abc import Mapping
 from datetime import date, datetime
 from http import HTTPStatus
 from pathlib import Path
+from typing import Any
+
+from constants import (
+    COMPANY_POLICY_RAG_SYSTEM_TEMPLATE,
+    DEFAULT_RAG_SIMILARITY_THRESHOLD,
+    DEFAULT_RAG_TOP_K,
+)
 
 # 供 AI function / tool 读取的本地文档根目录（与 utils.py 同级的 doc/）
 DOC_ROOT = Path(__file__).resolve().parent / "doc"
@@ -246,3 +254,101 @@ def list_files_in_directory(folder: str | Path) -> list[str]:
         for f in sorted(p.iterdir())
         if f.is_file() and not f.name.startswith(".")
     ]
+
+
+# --- LangChain 制度 RAG：上下文格式化与 CLI 辅助（与 langchain_rag 练习配合）---
+
+
+def format_rag_context(hits: list[dict[str, Any]]) -> str:
+    """将检索分块列表拼成注入大模型的上下文正文。"""
+    if not hits:
+        return "（未检索到达到相似度阈值的制度片段。）"
+    parts: list[str] = []
+    for i, h in enumerate(hits, start=1):
+        src = h.get("source_file") or "未知文件"
+        page = h.get("page_number")
+        sim = h.get("similarity")
+        if page is not None:
+            head = f"[{i}] 《{src}》第 {page} 页"
+        else:
+            head = f"[{i}] 《{src}》"
+        rr = h.get("rerank_score")
+        if rr is not None:
+            head += f"（rerank≈{float(rr):.3f}）"
+        if sim is not None:
+            head += f"（向量 similarity≈{float(sim):.3f}）"
+        parts.append(f"{head}\n{h.get('content', '').strip()}")
+    return "\n\n---\n\n".join(parts)
+
+
+def build_rag_prompt_text(
+    query: str,
+    hits: list[dict[str, Any]],
+    *,
+    system_template: str | None = None,
+) -> str:
+    """用系统模板拼装含「制度上下文 + 用户问题」的完整 system 提示。"""
+    tpl = system_template or COMPANY_POLICY_RAG_SYSTEM_TEMPLATE
+    return tpl.format(
+        context=format_rag_context(hits),
+        query=(query or "").strip(),
+    )
+
+
+def print_rag_similarity_results(results: list[dict[str, Any]]) -> None:
+    """CLI 下打印向量检索结果（简体中文）。"""
+    if not results:
+        print(
+            "未找到相关制度片段（可提高 -k、降低 --min-score，或使用 --no-min-score 取消过滤）。"
+        )
+        return
+    for i, row in enumerate(results, start=1):
+        sim = row.get("similarity", row.get("relevance_score"))
+        rr = row.get("rerank_score")
+        dist = row.get("distance")
+        src = row.get("source_file") or "?"
+        page = row.get("page_number")
+        dist_s = f"{dist:.4f}" if dist is not None else "?"
+        extra = f" | 精排={float(rr):.4f}" if rr is not None else ""
+        sim_s = f"{float(sim):.4f}" if sim is not None else "?"
+        print(
+            f"\n--- 片段 {i} | 向量相似度={sim_s}（越大越好）{extra} | 距离={dist_s}（越小越好）| "
+            f"来源={src} | 页码={page} ---"
+        )
+        print(row.get("content", "").strip())
+
+
+def rag_cli_score_threshold(args: argparse.Namespace) -> float | None:
+    """与 ``add_rag_query_and_retrieval_args`` 配套：是否启用 similarity 下限。"""
+    return None if args.no_min_score else args.min_score
+
+
+def add_rag_query_and_retrieval_args(
+    p: argparse.ArgumentParser, *, query_help: str
+) -> None:
+    """为 search / ask 子命令添加 query、top-k、min-score 参数。"""
+    p.add_argument("query", nargs="+", help=query_help)
+    p.add_argument(
+        "-k",
+        "--top-k",
+        type=int,
+        default=DEFAULT_RAG_TOP_K,
+        dest="top_k",
+        metavar="N",
+        help=f"检索片段数上限（默认 {DEFAULT_RAG_TOP_K}）",
+    )
+    p.add_argument(
+        "--min-score",
+        type=float,
+        default=DEFAULT_RAG_SIMILARITY_THRESHOLD,
+        metavar="S",
+        help=(
+            f"similarity(=1/(1+距离)) 下限，默认 {DEFAULT_RAG_SIMILARITY_THRESHOLD}；"
+            "越大越严"
+        ),
+    )
+    p.add_argument(
+        "--no-min-score",
+        action="store_true",
+        help="取消 similarity 下限（调试用）",
+    )
