@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import pickle
+import time
 from pathlib import Path
 from typing import Any
 import argparse
@@ -75,12 +76,31 @@ def _image_file_md5_hex(path: Path) -> str:
 
 
 def get_image_embedding(image_path):
-    """获取图片的 Embedding。"""
+    """获取图片的 Embedding（一维 float32，长度 = CLIP 视觉投影维度，如 512）。"""
+    import numpy as np
+
     image = Image.open(image_path)
     inputs = clip_processor(images=image, return_tensors="pt")
     with torch.no_grad():
-        image_features = clip_model.get_image_features(**inputs)
-    return image_features[0].numpy()
+        out = clip_model.get_image_features(**inputs)
+    # 新版 transformers：get_image_features 可能返回 BaseModelOutputWithPooling，
+    # 若对其做 out[0] 会得到 last_hidden_state (batch, seq, 768)，squeeze 后变成 (seq, 768) 误用。
+    if isinstance(out, torch.Tensor):
+        feat = out
+    else:
+        pool = getattr(out, "pooler_output", None)
+        if pool is not None:
+            feat = pool
+        else:
+            lhs = out.last_hidden_state
+            feat = clip_model.visual_projection(lhs[:, 0, :])
+    row = feat[0].detach().cpu().numpy()
+    row = np.squeeze(row, axis=None).astype(np.float32, copy=False)
+    if row.ndim != 1:
+        raise ValueError(
+            f"CLIP 图像向量应为 1 维，实际 shape={getattr(row, 'shape', None)}"
+        )
+    return row
 
 
 def persist_image_vectors_to_faiss(
@@ -89,6 +109,7 @@ def persist_image_vectors_to_faiss(
     save_dir: str | Path,
     *,
     index_name: str = "images.index",
+    log_write: bool = True,
 ) -> Path:
     """
     将图片向量写入本地 FAISS，并落盘 metadata 映射。
@@ -112,9 +133,24 @@ def persist_image_vectors_to_faiss(
     out_dir = Path(save_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    vec = np.array(image_vectors, dtype=np.float32)
+    rows: list[np.ndarray] = []
+    for v in image_vectors:
+        r = np.asarray(v, dtype=np.float32)
+        r = np.squeeze(r)
+        if r.ndim != 1:
+            raise ValueError(
+                f"每条 image 向量应为 1 维，实际 shape={r.shape}（请检查 get_image_embedding 输出）"
+            )
+        rows.append(r)
+    dim0 = int(rows[0].shape[0])
+    for i, r in enumerate(rows):
+        if int(r.shape[0]) != dim0:
+            raise ValueError(
+                f"向量维度不一致：第 0 条 dim={dim0}，第 {i} 条 dim={r.shape[0]}"
+            )
+    vec = np.stack(rows, axis=0)
     if vec.ndim != 2:
-        raise ValueError(f"image_vectors 期望二维数组 (n, d)，实际 ndim={vec.ndim}")
+        raise ValueError(f"image_vectors 期望堆叠为 (n, d)，实际 ndim={vec.ndim}")
 
     dim = int(vec.shape[1])
     index = faiss.IndexFlatL2(dim)
@@ -125,6 +161,11 @@ def persist_image_vectors_to_faiss(
     faiss.write_index(index, str(index_path))
     with meta_path.open("wb") as f:
         pickle.dump(metadata_store, f)
+    if log_write:
+        print(
+            f"[图片向量] 落盘完成 n={index.ntotal} dim={dim} "
+            f"faiss={index_path} meta={meta_path}"
+        )
     return out_dir
 
 
@@ -186,6 +227,7 @@ def create_images_vector_store(
     metadata_department: str = DEFAULT_WORD_CHUNK_METADATA_DEPARTMENT,
     metadata_update_time: str = DEFAULT_WORD_CHUNK_METADATA_UPDATE_TIME,
     image_index_start: int = 0,
+    log_vectors: bool = True,
 ) -> tuple[list[dict[str, Any]], list[Any]]:
     """
     遍历图片路径，计算 CLIP 向量，并生成与 Word 切片同形的 metadata。
@@ -193,18 +235,29 @@ def create_images_vector_store(
     metadata 与 ``doc_file_utils.build_chunks_for_word_document`` / ``build_chunks_from_parsed_markdown_file``
     对齐字段：``source_file``、``chunk_id``、``file_hash``、``department``、``update_time``、
     ``block_index``、``block_type``；并增加 ``content_basis``、``ocr_text``、``path_raw``（图片专用）。
+
+    ``log_vectors``：是否打印每张图进度（path、dim、L2、OCR 字数、ocr_ms、clip_ms）及落盘摘要。
     """
+    import numpy as np
+
     image_vectors: list[Any] = []
     metadata_store: list[dict[str, Any]] = []
+    n = len(image_paths)
+    t_batch0 = time.perf_counter()
+    if log_vectors and n:
+        print(f"[图片向量] 开始 CLIP 编码，共 {n} 张")
 
     for i, image_path in enumerate(image_paths):
         p = Path(image_path)
+        t_ocr0 = time.perf_counter()
         img_text_info = image_to_text(p)
+        ocr_ms = (time.perf_counter() - t_ocr0) * 1000.0
         doc_order = image_index_start + i + 1
+        chunk_id = f"img_{doc_order:02d}_ch_01"
         metadata_store.append(
             {
                 "source_file": p.name,
-                "chunk_id": f"img_{doc_order:02d}_ch_01",
+                "chunk_id": chunk_id,
                 "file_hash": _image_file_md5_hex(p),
                 "department": metadata_department,
                 "update_time": metadata_update_time,
@@ -215,7 +268,27 @@ def create_images_vector_store(
                 "path_raw": str(image_path),
             }
         )
-        image_vectors.append(get_image_embedding(p))
+        t_enc0 = time.perf_counter()
+        emb = get_image_embedding(p)
+        enc_ms = (time.perf_counter() - t_enc0) * 1000.0
+        image_vectors.append(emb)
+        if log_vectors:
+            ocr_n = len((img_text_info.get("ocr") or "").strip())
+            l2 = float(np.linalg.norm(emb))
+            path_hint = str(p.resolve()) if p.exists() else str(image_path)
+            print(
+                f"[图片向量] {i + 1}/{n} {chunk_id} file={p.name!r} "
+                f"path={path_hint} "
+                f"dim={emb.shape[0]} L2={l2:.4f} ocr_chars={ocr_n} "
+                f"ocr_ms={ocr_ms:.1f} clip_ms={enc_ms:.1f}"
+            )
+
+    if log_vectors and n:
+        total_ms = (time.perf_counter() - t_batch0) * 1000.0
+        print(
+            f"[图片向量] 编码完成，向量条数={len(image_vectors)}，"
+            f"CLIP 累计约 {total_ms:.0f} ms（含循环内开销，不含落盘）"
+        )
 
     return metadata_store, image_vectors
 
@@ -282,10 +355,12 @@ def _cmd_build_images(args: argparse.Namespace) -> None:
         print("[build-images] 未发现图片文件，跳过。")
         return
 
+    log_img = not getattr(args, "quiet_images", False)
     image_metadata_store, image_vectors = create_images_vector_store(
         image_abs_paths,
         metadata_department=args.department,
         metadata_update_time=args.update_time,
+        log_vectors=log_img,
     )
     out_dir = Path(args.out_dir) if args.out_dir else _DISNEY_IMAGE_FAISS_DIR
     persist_image_vectors_to_faiss(
@@ -293,6 +368,7 @@ def _cmd_build_images(args: argparse.Namespace) -> None:
         image_vectors,
         out_dir,
         index_name=args.index_name,
+        log_write=log_img,
     )
     print(
         f"[build-images] 完成：images={len(image_vectors)}；"
@@ -304,6 +380,25 @@ def _cmd_build_all(args: argparse.Namespace) -> None:
     """默认构建：文本 + 图片。"""
     _cmd_build_text(args)
     _cmd_build_images(args)
+
+
+def _default_build_all_namespace() -> argparse.Namespace:
+    """
+    未写子命令时 parse_args 不会带子解析器参数，补全与 build-all 相同的默认值，
+    避免 AttributeError（如缺少 verbose / chunk_size）。
+    """
+    return argparse.Namespace(
+        verbose=False,
+        department=DEFAULT_WORD_CHUNK_METADATA_DEPARTMENT,
+        update_time=DEFAULT_WORD_CHUNK_METADATA_UPDATE_TIME,
+        out_dir="",
+        api_key="",
+        embedding_model=_EMBEDDING_MODEL,
+        chunk_size=500,
+        chunk_overlap=80,
+        index_name="images.index",
+        quiet_images=False,
+    )
 
 
 def build_knowledge_base(
@@ -456,6 +551,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         default="images.index",
         help="图片索引文件前缀名（默认 images.index，产物为 .faiss + .pkl）",
     )
+    p_img.add_argument(
+        "--quiet-images",
+        action="store_true",
+        help="关闭 [图片向量] 逐张编码与落盘日志",
+    )
     p_img.set_defaults(handler=_cmd_build_images)
 
     p_all = sub.add_parser("build-all", help="构建文本+图片向量库（默认）")
@@ -490,6 +590,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         default="images.index",
         help="图片索引文件前缀名（默认 images.index，产物为 .faiss + .pkl）",
     )
+    p_all.add_argument(
+        "--quiet-images",
+        action="store_true",
+        help="关闭 [图片向量] 逐张编码与落盘日志",
+    )
     p_all.set_defaults(handler=_cmd_build_all)
 
     return parser
@@ -501,8 +606,8 @@ def main(argv: list[str] | None = None) -> None:
     if getattr(args, "handler", None) is not None:
         args.handler(args)
         return
-    # 未指定子命令时，默认构建文本 + 图片
-    _cmd_build_all(args)
+    # 未指定子命令时，默认构建文本 + 图片（须用完整 Namespace，不能直接用顶层 parse 结果）
+    _cmd_build_all(_default_build_all_namespace())
 
 
 if __name__ == "__main__":
