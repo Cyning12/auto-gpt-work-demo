@@ -39,6 +39,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
 
 from dashscope_embedding import get_dashscope_embeddings, log_embedding_failure_hint
+from dashscope_generation import call_dashscope_chat, chat_answer_text
 from disney_classify import classify_disney_knowledge_files
 from doc_file_utils import (
     DEFAULT_WORD_CHUNK_METADATA_DEPARTMENT,
@@ -332,6 +333,20 @@ def build_disney_rag_prompt(
         f"{q}\n"
     )
     return prompt, debug
+
+
+def generate_answer_with_dashscope(
+    *,
+    prompt: str,
+    model: str,
+    api_key: str | None = None,
+) -> str:
+    """
+    调用 DashScope 对话模型生成答案（复用 `dashscope_generation.py`，本文件不重复封装 SDK）。
+    """
+    messages = [{"role": "user", "content": (prompt or "").strip()}]
+    resp = call_dashscope_chat(messages, model=model, api_key=api_key)
+    return chat_answer_text(resp)
 
 
 def persist_image_vectors_to_faiss(
@@ -1075,6 +1090,12 @@ def _cmd_retrieve(args: argparse.Namespace) -> None:
         print(prompt)
         print("[retrieve] --- Prompt End ---")
         print(f"[retrieve] prompt_debug={dbg}")
+        if bool(getattr(args, "use_llm", False)):
+            key = (args.chat_api_key or "").strip() or _resolve_dashscope_api_key()
+            model = (args.chat_model or "").strip() or os.getenv("DASHSCOPE_CHAT_MODEL") or "qwen-turbo"
+            ans = generate_answer_with_dashscope(prompt=prompt, model=model, api_key=key or None)
+            print("[retrieve] --- LLM Answer ---")
+            print(ans)
 
 
 def _cmd_ask(args: argparse.Namespace) -> None:
@@ -1133,6 +1154,12 @@ def _cmd_ask(args: argparse.Namespace) -> None:
             print(prompt)
             print("[ask] --- Prompt End ---")
             print(f"[ask] prompt_debug={dbg}")
+            if bool(getattr(args, "use_llm", False)):
+                key = (args.chat_api_key or "").strip() or _resolve_dashscope_api_key()
+                model = (args.chat_model or "").strip() or os.getenv("DASHSCOPE_CHAT_MODEL") or "qwen-turbo"
+                ans = generate_answer_with_dashscope(prompt=prompt, model=model, api_key=key or None)
+                print("[ask] --- LLM Answer ---")
+                print(ans)
 
     preset = (getattr(args, "query", None) or "").strip()
     if preset:
@@ -1219,6 +1246,9 @@ def _default_ask_namespace() -> argparse.Namespace:
         c_min_lexical_score=0.12,
         print_prompt=False,
         prompt_max_context_chars=8000,
+        use_llm=False,
+        chat_model="",
+        chat_api_key="",
     )
 
 
@@ -1552,6 +1582,23 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         default=8000,
         help="Prompt 背景知识最大字符数（仅裁剪背景，默认 8000）",
     )
+    p_retrieve.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="在打印 Prompt 后调用 DashScope 对话模型生成最终回答",
+    )
+    p_retrieve.add_argument(
+        "--chat-model",
+        type=str,
+        default="",
+        help="对话模型名（默认环境变量 DASHSCOPE_CHAT_MODEL 或 'qwen-turbo'）",
+    )
+    p_retrieve.add_argument(
+        "--chat-api-key",
+        type=str,
+        default="",
+        help="对话 API Key（默认用 BAILIAN_API_KEY / DASHSCOPE_API_KEY）",
+    )
     p_retrieve.set_defaults(handler=_cmd_retrieve)
 
     p_ask = sub.add_parser(
@@ -1650,6 +1697,23 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         type=int,
         default=8000,
         help="Prompt 背景知识最大字符数（仅裁剪背景，默认 8000）",
+    )
+    p_ask.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="在打印 Prompt 后调用 DashScope 对话模型生成最终回答",
+    )
+    p_ask.add_argument(
+        "--chat-model",
+        type=str,
+        default="",
+        help="对话模型名（默认环境变量 DASHSCOPE_CHAT_MODEL 或 'qwen-turbo'）",
+    )
+    p_ask.add_argument(
+        "--chat-api-key",
+        type=str,
+        default="",
+        help="对话 API Key（默认用 BAILIAN_API_KEY / DASHSCOPE_API_KEY）",
     )
     p_ask.set_defaults(handler=_cmd_ask)
 
