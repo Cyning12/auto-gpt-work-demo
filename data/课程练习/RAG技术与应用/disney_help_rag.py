@@ -226,6 +226,114 @@ def similarity_search_image_topk_clip(
     return rows
 
 
+def build_disney_rag_prompt(
+    *,
+    query: str,
+    text_hits: list[dict[str, Any]] | None = None,
+    image_hits: list[dict[str, Any]] | None = None,
+    assistant_role: str = "迪士尼客服助手",
+    max_context_chars: int = 8000,
+) -> tuple[str, dict[str, Any]]:
+    """
+    为最终调用大模型准备的 Prompt 构建方法（当前 demo 阶段只打印，不实际调用模型）。
+
+    - 将文本向量召回结果 + 图片向量召回结果（含 OCR/路径）统一组织为结构化背景知识。
+    - 控制背景知识长度，避免 prompt 过长（max_context_chars 仅裁剪背景，不裁剪系统指令/问题）。
+
+    返回 (prompt, debug_info)：
+    - prompt：最终拼接好的提示词
+    - debug_info：包含条数、截断信息等，便于日志观察
+    """
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("query 不能为空")
+
+    def _clip(s: str, limit: int) -> str:
+        if limit <= 0:
+            return ""
+        ss = (s or "").strip()
+        if len(ss) <= limit:
+            return ss
+        return ss[: max(0, limit - 3)] + "..."
+
+    text_hits = list(text_hits or [])
+    image_hits = list(image_hits or [])
+
+    blocks: list[str] = []
+    used = 0
+    truncated = False
+
+    def _append_block(b: str) -> None:
+        nonlocal used, truncated
+        if truncated:
+            return
+        if not b:
+            return
+        remain = max_context_chars - used
+        if remain <= 0:
+            truncated = True
+            return
+        bb = b if len(b) <= remain else (b[: max(0, remain - 3)] + "...")
+        if len(bb) < len(b):
+            truncated = True
+        blocks.append(bb)
+        used += len(bb)
+
+    for i, h in enumerate(text_hits, start=1):
+        meta = h.get("metadata") or {}
+        source = meta.get("source_file") or meta.get("source") or "未知来源"
+        chunk_id = meta.get("chunk_id") or ""
+        dist = h.get("l2_distance")
+        content = h.get("page_content") or h.get("content") or ""
+        content = _clip(content, 1200)
+        _append_block(
+            "\n".join(
+                [
+                    f"背景知识-文本 {i} (来源: {source}; chunk_id: {chunk_id}; L2: {dist})：",
+                    content,
+                    "",
+                ]
+            )
+        )
+
+    for i, h in enumerate(image_hits, start=1):
+        meta = h.get("metadata") or {}
+        source = meta.get("source_file") or "未知图片"
+        chunk_id = meta.get("chunk_id") or ""
+        path_raw = meta.get("path_raw") or ""
+        dist = h.get("l2_distance")
+        ocr = _clip(meta.get("ocr_text") or "", 600)
+        _append_block(
+            "\n".join(
+                [
+                    f"背景知识-图片 {i} (文件: {source}; chunk_id: {chunk_id}; L2: {dist})：",
+                    f"- path_raw: {path_raw}",
+                    f"- ocr_text: {ocr}" if ocr else "- ocr_text: （空）",
+                    "",
+                ]
+            )
+        )
+
+    context_str = "\n".join(blocks).strip()
+    debug = {
+        "text_hits": len(text_hits),
+        "image_hits": len(image_hits),
+        "context_chars": len(context_str),
+        "max_context_chars": int(max_context_chars),
+        "truncated": bool(truncated),
+    }
+
+    prompt = (
+        f"你是一个{assistant_role}。请根据以下背景知识，用友好和专业的语气回答用户的问题。"
+        "请只使用背景知识中的信息，不要自行发挥。\n\n"
+        "[背景知识]\n"
+        f"{context_str}\n\n"
+        "[用户问题]\n"
+        f"{q}\n"
+    )
+    return prompt, debug
+
+
 def persist_image_vectors_to_faiss(
     metadata_store: list[dict[str, Any]],
     image_vectors: list[Any],
@@ -802,7 +910,8 @@ async def _retrieve_dual_async(
     embedder: Embeddings | None,
     text_dir: Path,
     image_dir: Path,
-    top_k: int,
+    text_top_k: int,
+    image_top_k: int = 3,
     text_index_name: str,
     image_index_name: str,
     require_text_key: bool,
@@ -814,6 +923,8 @@ async def _retrieve_dual_async(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """并发 + 路由：文本 Top-K（可选）与图片 Top-K（按 A/C/D 决定是否执行）。"""
     q = (q or "").strip()
+    text_k = max(1, int(text_top_k))
+    image_k = max(1, int(image_top_k))
 
     async def _text() -> dict[str, Any]:
         if embedder is None:
@@ -834,7 +945,7 @@ async def _retrieve_dual_async(
                 q,
                 embeddings=embedder,
                 text_faiss_dir=text_dir,
-                top_k=top_k,
+                top_k=text_k,
                 index_name=text_index_name,
             )
             return {"ok": True, "hits": hits}
@@ -847,7 +958,7 @@ async def _retrieve_dual_async(
                 similarity_search_image_topk_clip,
                 q,
                 image_faiss_dir=image_dir,
-                top_k=min(max(1, int(image_gate_k)), max(1, int(top_k))),
+                top_k=min(max(1, int(image_gate_k)), image_k),
                 index_name=image_index_name,
             )
             return {"ok": True, "hits": hits, "phase": "prefetch"}
@@ -899,7 +1010,7 @@ async def _retrieve_dual_async(
         )
 
     # Phase-2：需要完整 top_k；prefetch 已够用则复用
-    if int(top_k) <= int(image_gate_k) and img_prefetch.get("ok"):
+    if int(image_k) <= int(image_gate_k) and img_prefetch.get("ok"):
         img_prefetch["reason"] = route_reason
         return text_out, img_prefetch
 
@@ -908,7 +1019,7 @@ async def _retrieve_dual_async(
             similarity_search_image_topk_clip,
             q,
             image_faiss_dir=image_dir,
-            top_k=top_k,
+            top_k=image_k,
             index_name=image_index_name,
         )
         return text_out, {"ok": True, "reason": route_reason, "hits": full_hits, "phase": "full"}
@@ -940,7 +1051,8 @@ def _cmd_retrieve(args: argparse.Namespace) -> None:
             embedder=embedder,
             text_dir=text_dir,
             image_dir=image_dir,
-            top_k=k,
+            text_top_k=k,
+            image_top_k=3,
             text_index_name=args.text_index_name or "index",
             image_index_name=args.image_index_name or "images.index",
             require_text_key=True,
@@ -952,6 +1064,17 @@ def _cmd_retrieve(args: argparse.Namespace) -> None:
         )
     )
     _print_retrieve_results(text_out, image_out, q=q, k=k, tag="retrieve")
+    if bool(getattr(args, "print_prompt", False)):
+        prompt, dbg = build_disney_rag_prompt(
+            query=q,
+            text_hits=text_out.get("hits") or [],
+            image_hits=image_out.get("hits") or [],
+            max_context_chars=int(getattr(args, "prompt_max_context_chars", 8000)),
+        )
+        print("[retrieve] --- Prompt Start ---")
+        print(prompt)
+        print("[retrieve] --- Prompt End ---")
+        print(f"[retrieve] prompt_debug={dbg}")
 
 
 def _cmd_ask(args: argparse.Namespace) -> None:
@@ -986,7 +1109,8 @@ def _cmd_ask(args: argparse.Namespace) -> None:
                 embedder=embedder,
                 text_dir=text_dir,
                 image_dir=image_dir,
-                top_k=k,
+                text_top_k=k,
+                image_top_k=3,
                 text_index_name=text_index_name,
                 image_index_name=image_index_name,
                 require_text_key=False,
@@ -998,6 +1122,17 @@ def _cmd_ask(args: argparse.Namespace) -> None:
             )
         )
         _print_retrieve_results(text_out, image_out, q=q, k=k, tag="ask")
+        if bool(getattr(args, "print_prompt", False)):
+            prompt, dbg = build_disney_rag_prompt(
+                query=q,
+                text_hits=text_out.get("hits") or [],
+                image_hits=image_out.get("hits") or [],
+                max_context_chars=int(getattr(args, "prompt_max_context_chars", 8000)),
+            )
+            print("[ask] --- Prompt Start ---")
+            print(prompt)
+            print("[ask] --- Prompt End ---")
+            print(f"[ask] prompt_debug={dbg}")
 
     preset = (getattr(args, "query", None) or "").strip()
     if preset:
@@ -1082,6 +1217,8 @@ def _default_ask_namespace() -> argparse.Namespace:
         image_l2_threshold=8.0,
         image_margin_threshold=1.0,
         c_min_lexical_score=0.12,
+        print_prompt=False,
+        prompt_max_context_chars=8000,
     )
 
 
@@ -1333,7 +1470,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--top-k",
         type=int,
         default=10,
-        help="文本与图片各自返回的 Top-K（默认 10）",
+        help="文本返回的 Top-K（默认 10）；图片固定为 Top-3",
     )
     p_retrieve.add_argument(
         "--text-dir",
@@ -1404,6 +1541,17 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         default=0.12,
         help="方案C：query 与图片 OCR overlap 得分阈值（默认 0.12）",
     )
+    p_retrieve.add_argument(
+        "--print-prompt",
+        action="store_true",
+        help="打印为最终调用大模型准备的 Prompt（不实际调用模型）",
+    )
+    p_retrieve.add_argument(
+        "--prompt-max-context-chars",
+        type=int,
+        default=8000,
+        help="Prompt 背景知识最大字符数（仅裁剪背景，默认 8000）",
+    )
     p_retrieve.set_defaults(handler=_cmd_retrieve)
 
     p_ask = sub.add_parser(
@@ -1421,7 +1569,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--top-k",
         type=int,
         default=10,
-        help="文本与图片各自返回的 Top-K（默认 10）",
+        help="文本返回的 Top-K（默认 10）；图片固定为 Top-3",
     )
     p_ask.add_argument(
         "--text-dir",
@@ -1491,6 +1639,17 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.12,
         help="方案C：query 与图片 OCR overlap 得分阈值（默认 0.12）",
+    )
+    p_ask.add_argument(
+        "--print-prompt",
+        action="store_true",
+        help="打印为最终调用大模型准备的 Prompt（不实际调用模型）",
+    )
+    p_ask.add_argument(
+        "--prompt-max-context-chars",
+        type=int,
+        default=8000,
+        help="Prompt 背景知识最大字符数（仅裁剪背景，默认 8000）",
     )
     p_ask.set_defaults(handler=_cmd_ask)
 
