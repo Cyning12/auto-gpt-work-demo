@@ -673,6 +673,129 @@ def _print_retrieve_results(
     print(f"- image_ok={image_out.get('ok')} n={len(image_out.get('hits') or [])}")
 
 
+def _text_suggests_need_image(text_hits: list[dict[str, Any]]) -> tuple[bool, str]:
+    """
+    方案 D：基于文本召回内容/元数据判断是否可能需要图片。
+    只做轻量启发式，避免引入大模型或额外依赖。
+    """
+    cues = (
+        "地图",
+        "路线",
+        "示意",
+        "示意图",
+        "海报",
+        "图片",
+        "图示",
+        "截图",
+        "二维码",
+        "标识",
+        "指示牌",
+        "时间表",
+    )
+    for h in text_hits or []:
+        content = (h.get("page_content") or "").strip()
+        meta = h.get("metadata") or {}
+        src = str(meta.get("source_file") or "")
+        blob = content + "\n" + src
+        for c in cues:
+            if c in blob:
+                return True, f"text_cue:{c}"
+    return False, ""
+
+
+def _tokenize_zh_simple(s: str) -> list[str]:
+    """
+    无第三方依赖的中文粗分词：提取连续中英文数字片段，并补充 2-gram 以提升匹配稳定性。
+    适用于 demo 级路由（方案 C），不是严格 NLP 分词。
+    """
+    import re
+
+    text = (s or "").strip().lower()
+    if not text:
+        return []
+    parts = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text)
+    toks: list[str] = []
+    for p in parts:
+        if not p:
+            continue
+        toks.append(p)
+        if re.fullmatch(r"[\u4e00-\u9fff]+", p) and len(p) >= 4:
+            toks.extend([p[i : i + 2] for i in range(len(p) - 1)])
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in toks:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _route_need_image_local_c(
+    query: str,
+    *,
+    image_metadata_store: list[dict[str, Any]] | None,
+    min_lexical_score: float = 0.12,
+) -> tuple[bool, str, float]:
+    """
+    方案 C（不调用大模型）：本地路由器。
+    策略：query 触发词 +（可选）与图片 OCR 的 lexical overlap 估计。
+    """
+    q = (query or "").strip()
+    if not q:
+        return False, "empty_query", 0.0
+
+    explicit = ("图片", "海报", "示意图", "地图", "路线", "二维码", "截图", "长什么样", "长啥样", "给我看")
+    for t in explicit:
+        if t in q:
+            return True, f"explicit:{t}", 1.0
+
+    if not image_metadata_store:
+        return False, "no_image_meta", 0.0
+
+    qt = _tokenize_zh_simple(q)
+    if not qt:
+        return False, "no_query_tokens", 0.0
+    qset = set(qt)
+    best = 0.0
+    for m in image_metadata_store:
+        ocr = (m.get("ocr_text") or "").strip()
+        if not ocr:
+            continue
+        ot = _tokenize_zh_simple(ocr)
+        if not ot:
+            continue
+        oset = set(ot)
+        inter = len(qset & oset)
+        denom = max(1, min(len(qset), len(oset)))
+        score = inter / denom
+        if score > best:
+            best = score
+    if best >= float(min_lexical_score):
+        return True, "ocr_overlap", float(best)
+    return False, "lex_low", float(best)
+
+
+def _gate_image_by_vector_a(
+    prefetch_hits: list[dict[str, Any]],
+    *,
+    l2_threshold: float = 8.0,
+    margin_threshold: float = 1.0,
+) -> tuple[bool, str]:
+    """
+    方案 A：图片向量 gate（基于小 k 预取的距离/间隔）。
+    """
+    if not prefetch_hits:
+        return False, "no_image_hits"
+    d1 = float(prefetch_hits[0].get("l2_distance", 1e9))
+    d2 = float(prefetch_hits[1].get("l2_distance", 1e9)) if len(prefetch_hits) >= 2 else 1e9
+    margin = d2 - d1
+    if d1 <= float(l2_threshold):
+        return True, f"img_l2<=T({d1:.3f}<={l2_threshold})"
+    if margin >= float(margin_threshold):
+        return True, f"img_margin>=T({margin:.3f}>={margin_threshold})"
+    return False, f"img_gate_fail(d1={d1:.3f},m={margin:.3f})"
+
+
 async def _retrieve_dual_async(
     q: str,
     *,
@@ -683,8 +806,14 @@ async def _retrieve_dual_async(
     text_index_name: str,
     image_index_name: str,
     require_text_key: bool,
+    route_mode: str = "acd",
+    image_gate_k: int = 3,
+    image_l2_threshold: float = 8.0,
+    image_margin_threshold: float = 1.0,
+    c_min_lexical_score: float = 0.12,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """并发：文本 Top-K（可选，无 Key 时跳过）+ 图片 Top-K。"""
+    """并发 + 路由：文本 Top-K（可选）与图片 Top-K（按 A/C/D 决定是否执行）。"""
+    q = (q or "").strip()
 
     async def _text() -> dict[str, Any]:
         if embedder is None:
@@ -712,20 +841,79 @@ async def _retrieve_dual_async(
         except Exception as e:
             return {"ok": False, "error": str(e), "hits": []}
 
-    async def _image() -> dict[str, Any]:
+    async def _image_prefetch() -> dict[str, Any]:
         try:
             hits = await asyncio.to_thread(
                 similarity_search_image_topk_clip,
                 q,
                 image_faiss_dir=image_dir,
-                top_k=top_k,
+                top_k=min(max(1, int(image_gate_k)), max(1, int(top_k))),
                 index_name=image_index_name,
             )
-            return {"ok": True, "hits": hits}
+            return {"ok": True, "hits": hits, "phase": "prefetch"}
         except Exception as e:
-            return {"ok": False, "error": str(e), "hits": []}
+            return {"ok": False, "error": str(e), "hits": [], "phase": "prefetch"}
 
-    return await asyncio.gather(_text(), _image())
+    # Phase-1：并发 text + image(prefetch)
+    text_out, img_prefetch = await asyncio.gather(_text(), _image_prefetch())
+
+    # D：文本 cue
+    need_d, reason_d = _text_suggests_need_image(text_out.get("hits") or [])
+
+    # C：本地路由（可选）
+    need_c, reason_c, c_score = False, "disabled", 0.0
+    if (route_mode or "").lower() == "acd":
+        try:
+            _idx, img_meta = await asyncio.to_thread(
+                load_image_faiss_and_metadata,
+                image_dir,
+                index_name=image_index_name,
+            )
+        except Exception:
+            img_meta = None
+        need_c, reason_c, c_score = _route_need_image_local_c(
+            q,
+            image_metadata_store=img_meta,
+            min_lexical_score=c_min_lexical_score,
+        )
+
+    # A：向量 gate（基于 prefetch）
+    need_a, reason_a = _gate_image_by_vector_a(
+        img_prefetch.get("hits") or [],
+        l2_threshold=image_l2_threshold,
+        margin_threshold=image_margin_threshold,
+    )
+
+    need_image_full = bool(need_a or need_d or need_c)
+    route_reason = {
+        "route_mode": route_mode,
+        "A": reason_a,
+        "D": reason_d if need_d else "",
+        "C": f"{reason_c}({c_score:.3f})" if (route_mode or "").lower() == "acd" else "disabled",
+    }
+
+    if not need_image_full:
+        return (
+            text_out,
+            {"ok": False, "skipped": True, "reason": route_reason, "hits": []},
+        )
+
+    # Phase-2：需要完整 top_k；prefetch 已够用则复用
+    if int(top_k) <= int(image_gate_k) and img_prefetch.get("ok"):
+        img_prefetch["reason"] = route_reason
+        return text_out, img_prefetch
+
+    try:
+        full_hits = await asyncio.to_thread(
+            similarity_search_image_topk_clip,
+            q,
+            image_faiss_dir=image_dir,
+            top_k=top_k,
+            index_name=image_index_name,
+        )
+        return text_out, {"ok": True, "reason": route_reason, "hits": full_hits, "phase": "full"}
+    except Exception as e:
+        return text_out, {"ok": False, "error": str(e), "reason": route_reason, "hits": []}
 
 
 def _cmd_retrieve(args: argparse.Namespace) -> None:
@@ -756,6 +944,11 @@ def _cmd_retrieve(args: argparse.Namespace) -> None:
             text_index_name=args.text_index_name or "index",
             image_index_name=args.image_index_name or "images.index",
             require_text_key=True,
+            route_mode=args.route,
+            image_gate_k=args.image_gate_k,
+            image_l2_threshold=args.image_l2_threshold,
+            image_margin_threshold=args.image_margin_threshold,
+            c_min_lexical_score=args.c_min_lexical_score,
         )
     )
     _print_retrieve_results(text_out, image_out, q=q, k=k, tag="retrieve")
@@ -797,6 +990,11 @@ def _cmd_ask(args: argparse.Namespace) -> None:
                 text_index_name=text_index_name,
                 image_index_name=image_index_name,
                 require_text_key=False,
+                route_mode=args.route,
+                image_gate_k=args.image_gate_k,
+                image_l2_threshold=args.image_l2_threshold,
+                image_margin_threshold=args.image_margin_threshold,
+                c_min_lexical_score=args.c_min_lexical_score,
             )
         )
         _print_retrieve_results(text_out, image_out, q=q, k=k, tag="ask")
@@ -879,6 +1077,11 @@ def _default_ask_namespace() -> argparse.Namespace:
         image_index_name="images.index",
         api_key="",
         embedding_model=_EMBEDDING_MODEL,
+        route="acd",
+        image_gate_k=3,
+        image_l2_threshold=8.0,
+        image_margin_threshold=1.0,
+        c_min_lexical_score=0.12,
     )
 
 
@@ -1170,6 +1373,37 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         default=_EMBEDDING_MODEL,
         help=f"文本 embedding 模型，须与建库一致（默认 {_EMBEDDING_MODEL!r}）",
     )
+    p_retrieve.add_argument(
+        "--route",
+        type=str,
+        default="acd",
+        choices=("acd", "ad"),
+        help="图片检索路由策略：acd=方案A+本地C+方案D；ad=仅A+D（对比用）",
+    )
+    p_retrieve.add_argument(
+        "--image-gate-k",
+        type=int,
+        default=3,
+        help="方案A：图片向量 gate 的预取 k（默认 3）",
+    )
+    p_retrieve.add_argument(
+        "--image-l2-threshold",
+        type=float,
+        default=8.0,
+        help="方案A：top1 L2 小于该阈值则触发图片完整 Top-K（默认 8.0）",
+    )
+    p_retrieve.add_argument(
+        "--image-margin-threshold",
+        type=float,
+        default=1.0,
+        help="方案A：top2-top1 距离差大于该阈值则触发（默认 1.0）",
+    )
+    p_retrieve.add_argument(
+        "--c-min-lexical-score",
+        type=float,
+        default=0.12,
+        help="方案C：query 与图片 OCR overlap 得分阈值（默认 0.12）",
+    )
     p_retrieve.set_defaults(handler=_cmd_retrieve)
 
     p_ask = sub.add_parser(
@@ -1226,6 +1460,37 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         type=str,
         default=_EMBEDDING_MODEL,
         help=f"文本 embedding 模型（默认 {_EMBEDDING_MODEL!r}）",
+    )
+    p_ask.add_argument(
+        "--route",
+        type=str,
+        default="acd",
+        choices=("acd", "ad"),
+        help="图片检索路由策略：acd=方案A+本地C+方案D；ad=仅A+D（对比用）",
+    )
+    p_ask.add_argument(
+        "--image-gate-k",
+        type=int,
+        default=3,
+        help="方案A：图片向量 gate 的预取 k（默认 3）",
+    )
+    p_ask.add_argument(
+        "--image-l2-threshold",
+        type=float,
+        default=8.0,
+        help="方案A：top1 L2 小于该阈值则触发图片完整 Top-K（默认 8.0）",
+    )
+    p_ask.add_argument(
+        "--image-margin-threshold",
+        type=float,
+        default=1.0,
+        help="方案A：top2-top1 距离差大于该阈值则触发（默认 1.0）",
+    )
+    p_ask.add_argument(
+        "--c-min-lexical-score",
+        type=float,
+        default=0.12,
+        help="方案C：query 与图片 OCR overlap 得分阈值（默认 0.12）",
     )
     p_ask.set_defaults(handler=_cmd_ask)
 
