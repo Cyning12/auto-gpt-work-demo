@@ -634,6 +634,100 @@ def _cmd_inspect_local(args: argparse.Namespace) -> None:
     print(f"- image: {img_res}")
 
 
+def _print_retrieve_results(
+    text_out: dict[str, Any],
+    image_out: dict[str, Any],
+    *,
+    q: str,
+    k: int,
+    tag: str = "retrieve",
+) -> None:
+    """打印双路检索结果（文本 + 图片）。"""
+    print(f"[{tag}] query={q!r} top_k={k}")
+    print(f"[{tag}] --- 文本向量 Top-K（L2 越小越近）---")
+    if not text_out.get("ok"):
+        print(f"  失败: {text_out.get('error')}")
+    else:
+        for h in text_out.get("hits") or []:
+            meta = h.get("metadata") or {}
+            src = meta.get("source_file", "")
+            cid = meta.get("chunk_id", "")
+            prev = (h.get("page_content") or "")[:120].replace("\n", " ")
+            print(
+                f"  #{h.get('rank')} L2={h.get('l2_distance'):.4f} "
+                f"chunk_id={cid!r} source_file={src!r} preview={prev!r}"
+            )
+    print(f"[{tag}] --- 图片向量 Top-K（CLIP 文本↔图，L2 越小越近）---")
+    if not image_out.get("ok"):
+        print(f"  失败: {image_out.get('error')}")
+    else:
+        for h in image_out.get("hits") or []:
+            meta = h.get("metadata") or {}
+            print(
+                f"  #{h.get('rank')} L2={h.get('l2_distance'):.4f} "
+                f"chunk_id={meta.get('chunk_id')!r} file={meta.get('source_file')!r} "
+                f"path_raw={meta.get('path_raw')!r}"
+            )
+    print(f"[{tag}] 汇总：")
+    print(f"- text_ok={text_out.get('ok')} n={len(text_out.get('hits') or [])}")
+    print(f"- image_ok={image_out.get('ok')} n={len(image_out.get('hits') or [])}")
+
+
+async def _retrieve_dual_async(
+    q: str,
+    *,
+    embedder: Embeddings | None,
+    text_dir: Path,
+    image_dir: Path,
+    top_k: int,
+    text_index_name: str,
+    image_index_name: str,
+    require_text_key: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """并发：文本 Top-K（可选，无 Key 时跳过）+ 图片 Top-K。"""
+
+    async def _text() -> dict[str, Any]:
+        if embedder is None:
+            if require_text_key:
+                return {
+                    "ok": False,
+                    "error": "缺少 DashScope API Key，无法做文本向量检索",
+                    "hits": [],
+                }
+            return {
+                "ok": False,
+                "error": "未配置 API Key，已跳过文本向量检索",
+                "hits": [],
+            }
+        try:
+            hits = await asyncio.to_thread(
+                similarity_search_text_topk,
+                q,
+                embeddings=embedder,
+                text_faiss_dir=text_dir,
+                top_k=top_k,
+                index_name=text_index_name,
+            )
+            return {"ok": True, "hits": hits}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "hits": []}
+
+    async def _image() -> dict[str, Any]:
+        try:
+            hits = await asyncio.to_thread(
+                similarity_search_image_topk_clip,
+                q,
+                image_faiss_dir=image_dir,
+                top_k=top_k,
+                index_name=image_index_name,
+            )
+            return {"ok": True, "hits": hits}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "hits": []}
+
+    return await asyncio.gather(_text(), _image())
+
+
 def _cmd_retrieve(args: argparse.Namespace) -> None:
     """
     RAG 检索（暂不调用大模型）：对用户问句分别做文本向量 Top-K 与 CLIP 图片向量 Top-K，并发执行后汇总打印。
@@ -652,65 +746,79 @@ def _cmd_retrieve(args: argparse.Namespace) -> None:
         )
     embedder = get_dashscope_embeddings(key, model=args.embedding_model or _EMBEDDING_MODEL)
 
-    async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
-        async def _text() -> dict[str, Any]:
-            try:
-                hits = await asyncio.to_thread(
-                    similarity_search_text_topk,
-                    q,
-                    embeddings=embedder,
-                    text_faiss_dir=text_dir,
-                    top_k=k,
-                    index_name=args.text_index_name or "index",
-                )
-                return {"ok": True, "hits": hits}
-            except Exception as e:
-                return {"ok": False, "error": str(e), "hits": []}
+    text_out, image_out = asyncio.run(
+        _retrieve_dual_async(
+            q,
+            embedder=embedder,
+            text_dir=text_dir,
+            image_dir=image_dir,
+            top_k=k,
+            text_index_name=args.text_index_name or "index",
+            image_index_name=args.image_index_name or "images.index",
+            require_text_key=True,
+        )
+    )
+    _print_retrieve_results(text_out, image_out, q=q, k=k, tag="retrieve")
 
-        async def _image() -> dict[str, Any]:
-            try:
-                hits = await asyncio.to_thread(
-                    similarity_search_image_topk_clip,
-                    q,
-                    image_faiss_dir=image_dir,
-                    top_k=k,
-                    index_name=args.image_index_name or "images.index",
-                )
-                return {"ok": True, "hits": hits}
-            except Exception as e:
-                return {"ok": False, "error": str(e), "hits": []}
 
-        return await asyncio.gather(_text(), _image())
+def _cmd_ask(args: argparse.Namespace) -> None:
+    """
+    交互式问答入口（不调大模型）：循环读取用户问题，对每问执行与 retrieve 相同的双路 Top-K 检索。
+    无子命令运行脚本时默认进入本模式。
+    """
+    load_dotenv()
+    text_dir = Path(args.text_dir) if args.text_dir else _DISNEY_FAISS_DIR
+    image_dir = Path(args.image_dir) if args.image_dir else _DISNEY_IMAGE_FAISS_DIR
+    k = int(args.top_k)
+    text_index_name = args.text_index_name or "index"
+    image_index_name = args.image_index_name or "images.index"
 
-    text_out, image_out = asyncio.run(_run())
-    print(f"[retrieve] query={q!r} top_k={k}")
-    print("[retrieve] --- 文本向量 Top-K（L2 越小越近）---")
-    if not text_out.get("ok"):
-        print(f"  失败: {text_out.get('error')}")
+    key = (args.api_key or "").strip() or _resolve_dashscope_api_key()
+    embedder: Embeddings | None
+    if key:
+        embedder = get_dashscope_embeddings(key, model=args.embedding_model or _EMBEDDING_MODEL)
     else:
-        for h in text_out.get("hits") or []:
-            meta = h.get("metadata") or {}
-            src = meta.get("source_file", "")
-            cid = meta.get("chunk_id", "")
-            prev = (h.get("page_content") or "")[:120].replace("\n", " ")
-            print(
-                f"  #{h.get('rank')} L2={h.get('l2_distance'):.4f} "
-                f"chunk_id={cid!r} source_file={src!r} preview={prev!r}"
+        embedder = None
+        print(
+            "[ask] 未检测到 DashScope API Key，将跳过文本向量检索，仅执行图片 CLIP 检索。"
+        )
+
+    def _one_round(question: str) -> None:
+        q = question.strip()
+        if not q:
+            return
+        text_out, image_out = asyncio.run(
+            _retrieve_dual_async(
+                q,
+                embedder=embedder,
+                text_dir=text_dir,
+                image_dir=image_dir,
+                top_k=k,
+                text_index_name=text_index_name,
+                image_index_name=image_index_name,
+                require_text_key=False,
             )
-    print("[retrieve] --- 图片向量 Top-K（CLIP 文本↔图，L2 越小越近）---")
-    if not image_out.get("ok"):
-        print(f"  失败: {image_out.get('error')}")
-    else:
-        for h in image_out.get("hits") or []:
-            meta = h.get("metadata") or {}
-            print(
-                f"  #{h.get('rank')} L2={h.get('l2_distance'):.4f} "
-                f"chunk_id={meta.get('chunk_id')!r} file={meta.get('source_file')!r} "
-                f"path_raw={meta.get('path_raw')!r}"
-            )
-    print("[retrieve] 汇总：")
-    print(f"- text_ok={text_out.get('ok')} n={len(text_out.get('hits') or [])}")
-    print(f"- image_ok={image_out.get('ok')} n={len(image_out.get('hits') or [])}")
+        )
+        _print_retrieve_results(text_out, image_out, q=q, k=k, tag="ask")
+
+    preset = (getattr(args, "query", None) or "").strip()
+    if preset:
+        _one_round(preset)
+        return
+
+    print(
+        "[ask] 输入问题后回车检索（文本+图片 Top-K）；空行忽略；输入 quit / exit / q 结束。"
+    )
+    while True:
+        try:
+            line = input("问题> ")
+        except EOFError:
+            print("\n[ask] EOF，结束。")
+            break
+        if line.strip().lower() in ("quit", "exit", "q"):
+            print("[ask] 再见。")
+            break
+        _one_round(line)
 
 
 def _cmd_build_all(args: argparse.Namespace) -> None:
@@ -757,6 +865,20 @@ def _default_build_all_namespace() -> argparse.Namespace:
         chunk_overlap=80,
         index_name="images.index",
         quiet_images=False,
+    )
+
+
+def _default_ask_namespace() -> argparse.Namespace:
+    """无子命令时进入 ask 交互模式所需的默认参数。"""
+    return argparse.Namespace(
+        query="",
+        top_k=10,
+        text_dir="",
+        image_dir="",
+        text_index_name="index",
+        image_index_name="images.index",
+        api_key="",
+        embedding_model=_EMBEDDING_MODEL,
     )
 
 
@@ -841,7 +963,9 @@ def build_knowledge_base(
 
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="迪士尼知识库：构建/检查本地 FAISS；retrieve 为双路相似度检索（不调大模型）。",
+        description=(
+            "迪士尼知识库：默认 ask 交互双路检索；子命令可构建向量库、inspect-local、retrieve 等（不调对话大模型）。"
+        ),
     )
     sub = parser.add_subparsers(dest="cmd", required=False)
 
@@ -1048,6 +1172,63 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     )
     p_retrieve.set_defaults(handler=_cmd_retrieve)
 
+    p_ask = sub.add_parser(
+        "ask",
+        help="交互式双路检索：循环输入问题（也可单次传入 query）；默认无子命令时进入本模式",
+    )
+    p_ask.add_argument(
+        "query",
+        nargs="?",
+        default="",
+        help="可选：单次提问；省略则进入交互输入",
+    )
+    p_ask.add_argument(
+        "-k",
+        "--top-k",
+        type=int,
+        default=10,
+        help="文本与图片各自返回的 Top-K（默认 10）",
+    )
+    p_ask.add_argument(
+        "--text-dir",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="文本向量库目录（默认 vectorModels/迪士尼RAG知识库）",
+    )
+    p_ask.add_argument(
+        "--image-dir",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="图片向量库目录（默认 vectorModels/迪士尼RAG知识库/images）",
+    )
+    p_ask.add_argument(
+        "--text-index-name",
+        type=str,
+        default="index",
+        help="文本 index 前缀（默认 index）",
+    )
+    p_ask.add_argument(
+        "--image-index-name",
+        type=str,
+        default="images.index",
+        help="图片 index 前缀（默认 images.index）",
+    )
+    p_ask.add_argument(
+        "--api-key",
+        type=str,
+        default="",
+        help="DashScope API Key（文本检索用；无则仅跑图片 CLIP 检索）",
+    )
+    p_ask.add_argument(
+        "--embedding-model",
+        type=str,
+        default=_EMBEDDING_MODEL,
+        help=f"文本 embedding 模型（默认 {_EMBEDDING_MODEL!r}）",
+    )
+    p_ask.set_defaults(handler=_cmd_ask)
+
     return parser
 
 
@@ -1057,8 +1238,8 @@ def main(argv: list[str] | None = None) -> None:
     if getattr(args, "handler", None) is not None:
         args.handler(args)
         return
-    # 未指定子命令时，默认构建文本 + 图片（须用完整 Namespace，不能直接用顶层 parse 结果）
-    _cmd_build_all(_default_build_all_namespace())
+    # 未指定子命令：默认进入 ask 交互检索（不调大模型）
+    _cmd_ask(_default_ask_namespace())
 
 
 if __name__ == "__main__":
