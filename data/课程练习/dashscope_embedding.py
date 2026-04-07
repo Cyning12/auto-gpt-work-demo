@@ -31,7 +31,6 @@ from dashscope_generation import set_dashscope_api_key
 # 与 langchain_community.embeddings.dashscope 中 BATCH_SIZE 一致
 DASHSCOPE_EMBED_BATCH_SIZE: dict[str, int] = {
     "text-embedding-v1": 25,
-    "text-embedding-v2": 25,
 }
 
 _EMBED_NETWORK_RETRY = 5
@@ -46,7 +45,7 @@ RETRYABLE_EMBEDDING_ERRORS: tuple[type[BaseException], ...] = (
 
 _logger = logging.getLogger(__name__)
 
-DEFAULT_EMBEDDING_MODEL = "text-embedding-v2"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-v1"
 
 
 def call_text_embedding(

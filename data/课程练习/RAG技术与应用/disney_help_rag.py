@@ -19,6 +19,8 @@ import os
 import sys
 import pickle
 import time
+import asyncio
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 import argparse
@@ -46,7 +48,6 @@ from doc_file_utils import (
     export_parsed_markdown_chunks_for_doc_paths,
     persist_word_chunks_to_faiss,
 )
-from hf_clip_utils import load_clip_model_and_processor
 from image_file_utils import image_to_text
 
 _DISNEY_KNOWLEDGE_BASE = _PRACTICE_ROOT / "source" / "迪士尼RAG知识库"
@@ -55,19 +56,27 @@ _CHUNKS_JSON_DIR = _PRACTICE_ROOT / "doc" / "迪士尼RAG知识库" / "chunks_js
 # 与 langchain_rag._VECTOR_MODEL_PATH 风格一致：向量库落盘目录
 _DISNEY_FAISS_DIR = _PRACTICE_ROOT / "vectorModels" / "迪士尼RAG知识库"
 _DISNEY_IMAGE_FAISS_DIR = _DISNEY_FAISS_DIR / "images"
-_EMBEDDING_MODEL = "text-embedding-v2"
-
-# CLIP：默认缓存 ~/.cache/huggingface/hub/；可传 revision= 钉死权重，见 hf_clip_utils 模块说明
-print("正在加载 CLIP 模型...")
-try:
-    clip_model, clip_processor = load_clip_model_and_processor()
-    print("CLIP 模型加载成功。")
-except Exception as e:
-    print(f"加载 CLIP 模型失败，请检查网络连接或 Hugging Face Token。错误: {e}")
-    raise SystemExit(1) from e
+_EMBEDDING_MODEL = "text-embedding-v1"
 
 from PIL import Image
 import torch
+
+
+@lru_cache(maxsize=1)
+def _get_clip_model_and_processor():
+    """
+    懒加载 CLIP（进程内缓存复用）。
+
+    仅在需要**重新编码**图片向量时才加载，避免 inspect-local / 仅文本流程也触发 HF Hub 请求，
+    以及命中图片向量缓存时仍加载大模型。
+    """
+    # 延迟导入，避免 CLI 仅做本地读取时也触发 transformers 初始化链路
+    from hf_clip_utils import load_clip_model_and_processor
+
+    print("正在加载 CLIP 模型...")
+    model, processor = load_clip_model_and_processor()
+    print("CLIP 模型加载成功。")
+    return model, processor
 
 
 def _image_file_md5_hex(path: Path) -> str:
@@ -80,6 +89,7 @@ def get_image_embedding(image_path):
     import numpy as np
 
     image = Image.open(image_path)
+    clip_model, clip_processor = _get_clip_model_and_processor()
     inputs = clip_processor(images=image, return_tensors="pt")
     with torch.no_grad():
         out = clip_model.get_image_features(**inputs)
@@ -101,6 +111,119 @@ def get_image_embedding(image_path):
             f"CLIP 图像向量应为 1 维，实际 shape={getattr(row, 'shape', None)}"
         )
     return row
+
+
+def get_clip_text_embedding_1d(text: str):
+    """将用户问句编码为 CLIP 文本侧向量（与图片向量同空间，用于跨模态检索）。"""
+    import numpy as np
+
+    clip_model, clip_processor = _get_clip_model_and_processor()
+    inputs = clip_processor(
+        text=[text],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+    )
+    with torch.no_grad():
+        out = clip_model.get_text_features(**inputs)
+    if isinstance(out, torch.Tensor):
+        feat = out
+    else:
+        pool = getattr(out, "pooler_output", None)
+        if pool is not None:
+            feat = pool
+        else:
+            lhs = out.last_hidden_state
+            feat = clip_model.text_projection(lhs[:, -1, :])
+    row = feat[0].detach().cpu().numpy()
+    row = np.squeeze(row, axis=None).astype(np.float32, copy=False)
+    if row.ndim != 1:
+        raise ValueError(
+            f"CLIP 文本向量应为 1 维，实际 shape={getattr(row, 'shape', None)}"
+        )
+    return row
+
+
+def similarity_search_text_topk(
+    query: str,
+    *,
+    embeddings: Embeddings,
+    text_faiss_dir: str | Path,
+    top_k: int = 10,
+    index_name: str = "index",
+) -> list[dict[str, Any]]:
+    """
+    文本向量库：基于 DashScope（与建库相同）对 query 做 embed_query，再在 LangChain FAISS 中取 Top-K。
+
+    返回列表元素含 ``rank``、``l2_distance``、``page_content``、``metadata``（便于后续与图片结果分流处理）。
+    """
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("query 不能为空")
+
+    vs = load_text_faiss_vector_store(
+        text_faiss_dir,
+        embeddings,
+        index_name=index_name,
+    )
+    k = max(1, int(top_k))
+    pairs = vs.similarity_search_with_score(q, k=k)
+    rows: list[dict[str, Any]] = []
+    for rank, (doc, dist) in enumerate(pairs, start=1):
+        meta = dict(doc.metadata) if doc.metadata else {}
+        rows.append(
+            {
+                "rank": rank,
+                "l2_distance": float(dist),
+                "page_content": doc.page_content,
+                "metadata": meta,
+            }
+        )
+    return rows
+
+
+def similarity_search_image_topk_clip(
+    query: str,
+    *,
+    image_faiss_dir: str | Path,
+    top_k: int = 10,
+    index_name: str = "images.index",
+) -> list[dict[str, Any]]:
+    """
+    图片向量库：CLIP 文本编码 query，在本地 ``IndexFlatL2`` 上取 Top-K。
+
+    返回列表元素含 ``rank``、``l2_distance``、``metadata``（与建库时 pickle 一致）。
+    """
+    import numpy as np
+
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("query 不能为空")
+
+    index, metadata_store = load_image_faiss_and_metadata(
+        image_faiss_dir,
+        index_name=index_name,
+    )
+    ntotal = int(getattr(index, "ntotal", 0) or 0)
+    if ntotal <= 0:
+        return []
+
+    vec = get_clip_text_embedding_1d(q).astype(np.float32, copy=False).reshape(1, -1)
+    k = min(max(1, int(top_k)), ntotal)
+    dists, ids = index.search(vec, k)
+    rows: list[dict[str, Any]] = []
+    for rank, (dist, idx) in enumerate(zip(dists[0], ids[0]), start=1):
+        ii = int(idx)
+        if ii < 0 or ii >= len(metadata_store):
+            continue
+        rows.append(
+            {
+                "rank": rank,
+                "l2_distance": float(dist),
+                "metadata": dict(metadata_store[ii]),
+            }
+        )
+    return rows
 
 
 def persist_image_vectors_to_faiss(
@@ -206,6 +329,52 @@ def load_image_faiss_and_metadata(
     return index, metadata_store
 
 
+def get_or_create_image_faiss_cache(
+    image_paths: list[str] | list[Path],
+    save_dir: str | Path,
+    *,
+    index_name: str = "images.index",
+    use_cache: bool = True,
+    metadata_department: str = DEFAULT_WORD_CHUNK_METADATA_DEPARTMENT,
+    metadata_update_time: str = DEFAULT_WORD_CHUNK_METADATA_UPDATE_TIME,
+    quiet_images: bool = False,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """
+    获取（优先本地缓存）或创建图片向量库，并返回 ``(faiss_index, metadata_store)``。
+
+    - **use_cache=True**：若 ``{save_dir}/{index_name}.faiss`` 与 ``.pkl`` 存在，则直接读取；
+      否则重新编码图片并落盘，再读取返回。
+    - **use_cache=False**：强制重新编码并覆盖落盘（适合模型升级/元数据变更/排错）。
+    """
+    base = Path(save_dir)
+    index_path = base / f"{index_name}.faiss"
+    meta_path = base / f"{index_name}.pkl"
+    can_load = use_cache and index_path.is_file() and meta_path.is_file()
+    if can_load:
+        if not quiet_images:
+            print(f"[图片向量] 命中本地缓存：{index_path} / {meta_path}")
+        return load_image_faiss_and_metadata(base, index_name=index_name)
+
+    if not quiet_images:
+        reason = "禁用缓存" if not use_cache else "缓存不存在"
+        print(f"[图片向量] 重新构建（{reason}）：out={base} index_name={index_name!r}")
+
+    meta, vecs = create_images_vector_store(
+        image_paths,
+        metadata_department=metadata_department,
+        metadata_update_time=metadata_update_time,
+        log_vectors=not quiet_images,
+    )
+    persist_image_vectors_to_faiss(
+        meta,
+        vecs,
+        base,
+        index_name=index_name,
+        log_write=not quiet_images,
+    )
+    return load_image_faiss_and_metadata(base, index_name=index_name)
+
+
 def load_text_faiss_vector_store(
     save_dir: str | Path,
     embeddings: Embeddings,
@@ -219,6 +388,46 @@ def load_text_faiss_vector_store(
         index_name=index_name,
         allow_dangerous_deserialization=True,
     )
+
+
+def load_text_faiss_index_and_metadata(
+    save_dir: str | Path,
+    *,
+    index_name: str = "index",
+) -> tuple[Any, Any, dict[int, str]]:
+    """
+    **不依赖 Embeddings** 地读取本地文本向量库（与 LangChain `FAISS.save_local` 产物兼容）。
+
+    返回 ``(faiss_index, docstore, index_to_docstore_id)``：
+    - ``{save_dir}/{index_name}.faiss``：FAISS 索引
+    - ``{save_dir}/{index_name}.pkl``：pickle，内容为 ``(docstore, index_to_docstore_id)``
+
+    用途：仅做本地“是否存在/能读/规模统计”或后续自定义检索（避免因 embeddings 触发 API）。
+    """
+    import faiss
+
+    base = Path(save_dir)
+    index_path = base / f"{index_name}.faiss"
+    meta_path = base / f"{index_name}.pkl"
+    if not index_path.is_file():
+        raise FileNotFoundError(f"文本索引不存在: {index_path}")
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"文本 metadata 不存在: {meta_path}")
+
+    index = faiss.read_index(str(index_path))
+    with meta_path.open("rb") as f:
+        docstore, index_to_docstore_id = pickle.load(f)
+    if not isinstance(index_to_docstore_id, dict):
+        raise ValueError(
+            f"index_to_docstore_id 格式异常，期望 dict，实际 {type(index_to_docstore_id)}"
+        )
+    if getattr(index, "ntotal", None) is not None and index.ntotal != len(
+        index_to_docstore_id
+    ):
+        raise ValueError(
+            f"文本索引与映射数量不一致: index.ntotal={index.ntotal} vs map={len(index_to_docstore_id)}"
+        )
+    return index, docstore, index_to_docstore_id
 
 
 def create_images_vector_store(
@@ -355,31 +564,181 @@ def _cmd_build_images(args: argparse.Namespace) -> None:
         print("[build-images] 未发现图片文件，跳过。")
         return
 
-    log_img = not getattr(args, "quiet_images", False)
-    image_metadata_store, image_vectors = create_images_vector_store(
-        image_abs_paths,
-        metadata_department=args.department,
-        metadata_update_time=args.update_time,
-        log_vectors=log_img,
-    )
     out_dir = Path(args.out_dir) if args.out_dir else _DISNEY_IMAGE_FAISS_DIR
-    persist_image_vectors_to_faiss(
-        image_metadata_store,
-        image_vectors,
+    quiet_images = bool(getattr(args, "quiet_images", False))
+    index, meta = get_or_create_image_faiss_cache(
+        image_abs_paths,
         out_dir,
         index_name=args.index_name,
-        log_write=log_img,
+        use_cache=not bool(getattr(args, "no_cache", False)),
+        metadata_department=args.department,
+        metadata_update_time=args.update_time,
+        quiet_images=quiet_images,
     )
     print(
-        f"[build-images] 完成：images={len(image_vectors)}；"
+        f"[build-images] 完成：images={index.ntotal}；"
         f"向量库目录={out_dir}（{args.index_name}.faiss / {args.index_name}.pkl）"
     )
 
 
+def _cmd_inspect_local(args: argparse.Namespace) -> None:
+    """并发读取本地文本/图片向量库（不重建），汇总输出。"""
+    text_dir = Path(args.text_dir) if args.text_dir else _DISNEY_FAISS_DIR
+    image_dir = Path(args.image_dir) if args.image_dir else _DISNEY_IMAGE_FAISS_DIR
+    text_index_name = args.text_index_name or "index"
+    image_index_name = args.image_index_name or "images.index"
+
+    async def _load_text() -> dict[str, Any]:
+        idx, docstore, mapping = await asyncio.to_thread(
+            load_text_faiss_index_and_metadata,
+            text_dir,
+            index_name=text_index_name,
+        )
+        # docstore 多为 InMemoryDocstore，有 _dict；这里做兼容性统计
+        ds_len = getattr(docstore, "_dict", None)
+        return {
+            "ok": True,
+            "index_ntotal": getattr(idx, "ntotal", None),
+            "index_dim": getattr(idx, "d", None),
+            "docstore_size": len(ds_len) if isinstance(ds_len, dict) else None,
+            "mapping_size": len(mapping),
+            "dir": str(text_dir),
+        }
+
+    async def _load_images() -> dict[str, Any]:
+        idx, meta = await asyncio.to_thread(
+            load_image_faiss_and_metadata,
+            image_dir,
+            index_name=image_index_name,
+        )
+        return {
+            "ok": True,
+            "index_ntotal": getattr(idx, "ntotal", None),
+            "index_dim": getattr(idx, "d", None),
+            "metadata_size": len(meta),
+            "dir": str(image_dir),
+        }
+
+    async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
+        async def _wrap(coro):
+            try:
+                return await coro
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        return await asyncio.gather(_wrap(_load_text()), _wrap(_load_images()))
+
+    text_res, img_res = asyncio.run(_run())
+    print("[inspect-local] 汇总：")
+    print(f"- text: {text_res}")
+    print(f"- image: {img_res}")
+
+
+def _cmd_retrieve(args: argparse.Namespace) -> None:
+    """
+    RAG 检索（暂不调用大模型）：对用户问句分别做文本向量 Top-K 与 CLIP 图片向量 Top-K，并发执行后汇总打印。
+    """
+    load_dotenv()
+    text_dir = Path(args.text_dir) if args.text_dir else _DISNEY_FAISS_DIR
+    image_dir = Path(args.image_dir) if args.image_dir else _DISNEY_IMAGE_FAISS_DIR
+    k = int(args.top_k)
+    q = (args.query or "").strip()
+
+    key = (args.api_key or "").strip() or _resolve_dashscope_api_key()
+    if not key:
+        raise ValueError(
+            "文本检索需要 DashScope API Key：请设置 BAILIAN_API_KEY 或 DASHSCOPE_API_KEY，"
+            "或传入 --api-key（图片侧用 CLIP，不依赖该 Key）。"
+        )
+    embedder = get_dashscope_embeddings(key, model=args.embedding_model or _EMBEDDING_MODEL)
+
+    async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
+        async def _text() -> dict[str, Any]:
+            try:
+                hits = await asyncio.to_thread(
+                    similarity_search_text_topk,
+                    q,
+                    embeddings=embedder,
+                    text_faiss_dir=text_dir,
+                    top_k=k,
+                    index_name=args.text_index_name or "index",
+                )
+                return {"ok": True, "hits": hits}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "hits": []}
+
+        async def _image() -> dict[str, Any]:
+            try:
+                hits = await asyncio.to_thread(
+                    similarity_search_image_topk_clip,
+                    q,
+                    image_faiss_dir=image_dir,
+                    top_k=k,
+                    index_name=args.image_index_name or "images.index",
+                )
+                return {"ok": True, "hits": hits}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "hits": []}
+
+        return await asyncio.gather(_text(), _image())
+
+    text_out, image_out = asyncio.run(_run())
+    print(f"[retrieve] query={q!r} top_k={k}")
+    print("[retrieve] --- 文本向量 Top-K（L2 越小越近）---")
+    if not text_out.get("ok"):
+        print(f"  失败: {text_out.get('error')}")
+    else:
+        for h in text_out.get("hits") or []:
+            meta = h.get("metadata") or {}
+            src = meta.get("source_file", "")
+            cid = meta.get("chunk_id", "")
+            prev = (h.get("page_content") or "")[:120].replace("\n", " ")
+            print(
+                f"  #{h.get('rank')} L2={h.get('l2_distance'):.4f} "
+                f"chunk_id={cid!r} source_file={src!r} preview={prev!r}"
+            )
+    print("[retrieve] --- 图片向量 Top-K（CLIP 文本↔图，L2 越小越近）---")
+    if not image_out.get("ok"):
+        print(f"  失败: {image_out.get('error')}")
+    else:
+        for h in image_out.get("hits") or []:
+            meta = h.get("metadata") or {}
+            print(
+                f"  #{h.get('rank')} L2={h.get('l2_distance'):.4f} "
+                f"chunk_id={meta.get('chunk_id')!r} file={meta.get('source_file')!r} "
+                f"path_raw={meta.get('path_raw')!r}"
+            )
+    print("[retrieve] 汇总：")
+    print(f"- text_ok={text_out.get('ok')} n={len(text_out.get('hits') or [])}")
+    print(f"- image_ok={image_out.get('ok')} n={len(image_out.get('hits') or [])}")
+
+
 def _cmd_build_all(args: argparse.Namespace) -> None:
     """默认构建：文本 + 图片。"""
-    _cmd_build_text(args)
-    _cmd_build_images(args)
+    # 并发执行：两边都跑完后再汇总；任一失败不阻断另一方。
+    async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
+        async def _wrap(name: str, fn) -> dict[str, Any]:
+            t0 = time.perf_counter()
+            try:
+                await asyncio.to_thread(fn, args)
+                return {"ok": True, "task": name, "ms": (time.perf_counter() - t0) * 1000.0}
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "task": name,
+                    "ms": (time.perf_counter() - t0) * 1000.0,
+                    "error": str(e),
+                }
+
+        return await asyncio.gather(
+            _wrap("build-text", _cmd_build_text),
+            _wrap("build-images", _cmd_build_images),
+        )
+
+    text_res, img_res = asyncio.run(_run())
+    print("[build-all] 汇总：")
+    print(f"- text: {text_res}")
+    print(f"- image: {img_res}")
 
 
 def _default_build_all_namespace() -> argparse.Namespace:
@@ -465,26 +824,24 @@ def build_knowledge_base(
             if image_faiss_save_dir is not None
             else (target / "images")
         )
-        image_metadata_store, image_vectors = create_images_vector_store(
+        _idx, _meta = get_or_create_image_faiss_cache(
             image_paths,
-            metadata_department=DEFAULT_WORD_CHUNK_METADATA_DEPARTMENT,
-            metadata_update_time=DEFAULT_WORD_CHUNK_METADATA_UPDATE_TIME,
-        )
-        persist_image_vectors_to_faiss(
-            image_metadata_store,
-            image_vectors,
             img_dir,
             index_name="images.index",
+            use_cache=True,
+            metadata_department=DEFAULT_WORD_CHUNK_METADATA_DEPARTMENT,
+            metadata_update_time=DEFAULT_WORD_CHUNK_METADATA_UPDATE_TIME,
+            quiet_images=False,
         )
         print(
-            f"[build_knowledge_base] 已写入图片 FAISS：{img_dir}，图片数 {len(image_vectors)}。"
+            f"[build_knowledge_base] 图片 FAISS 已就绪：{img_dir}，图片数 {_idx.ntotal}。"
         )
     return metadata_store, vs, image_vectors
 
 
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="迪士尼知识库：构建文本/图片向量库到本地 FAISS。",
+        description="迪士尼知识库：构建/检查本地 FAISS；retrieve 为双路相似度检索（不调大模型）。",
     )
     sub = parser.add_subparsers(dest="cmd", required=False)
 
@@ -556,6 +913,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="关闭 [图片向量] 逐张编码与落盘日志",
     )
+    p_img.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="不使用本地图片向量缓存，强制重新构建并覆盖落盘",
+    )
     p_img.set_defaults(handler=_cmd_build_images)
 
     p_all = sub.add_parser("build-all", help="构建文本+图片向量库（默认）")
@@ -595,7 +957,96 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="关闭 [图片向量] 逐张编码与落盘日志",
     )
+    p_all.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="不使用本地图片向量缓存，强制重新构建并覆盖落盘",
+    )
     p_all.set_defaults(handler=_cmd_build_all)
+
+    p_inspect = sub.add_parser(
+        "inspect-local",
+        help="并发读取本地 text/image 向量库并汇总（不重建，不调用 embeddings API）",
+    )
+    p_inspect.add_argument(
+        "--text-dir",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="文本向量库目录（默认 vectorModels/迪士尼RAG知识库）",
+    )
+    p_inspect.add_argument(
+        "--image-dir",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="图片向量库目录（默认 vectorModels/迪士尼RAG知识库/images）",
+    )
+    p_inspect.add_argument(
+        "--text-index-name",
+        type=str,
+        default="index",
+        help="文本 index_name 前缀（默认 index）",
+    )
+    p_inspect.add_argument(
+        "--image-index-name",
+        type=str,
+        default="images.index",
+        help="图片 index_name 前缀（默认 images.index）",
+    )
+    p_inspect.set_defaults(handler=_cmd_inspect_local)
+
+    p_retrieve = sub.add_parser(
+        "retrieve",
+        help="对用户问句并发检索：文本向量 Top-K + CLIP 图片向量 Top-K（不调对话大模型）",
+    )
+    p_retrieve.add_argument("query", type=str, help="用户问题（自然语言）")
+    p_retrieve.add_argument(
+        "-k",
+        "--top-k",
+        type=int,
+        default=10,
+        help="文本与图片各自返回的 Top-K（默认 10）",
+    )
+    p_retrieve.add_argument(
+        "--text-dir",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="文本向量库目录（默认 vectorModels/迪士尼RAG知识库）",
+    )
+    p_retrieve.add_argument(
+        "--image-dir",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="图片向量库目录（默认 vectorModels/迪士尼RAG知识库/images）",
+    )
+    p_retrieve.add_argument(
+        "--text-index-name",
+        type=str,
+        default="index",
+        help="文本 index 前缀（默认 index）",
+    )
+    p_retrieve.add_argument(
+        "--image-index-name",
+        type=str,
+        default="images.index",
+        help="图片 index 前缀（默认 images.index）",
+    )
+    p_retrieve.add_argument(
+        "--api-key",
+        type=str,
+        default="",
+        help="DashScope API Key（文本 query 向量化用；也可用环境变量）",
+    )
+    p_retrieve.add_argument(
+        "--embedding-model",
+        type=str,
+        default=_EMBEDDING_MODEL,
+        help=f"文本 embedding 模型，须与建库一致（默认 {_EMBEDDING_MODEL!r}）",
+    )
+    p_retrieve.set_defaults(handler=_cmd_retrieve)
 
     return parser
 
