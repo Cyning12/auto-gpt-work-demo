@@ -120,6 +120,63 @@ flowchart TB
 
 ### 3.2 `langchain_rag.py` 内部：函数谁调谁
 
+---
+
+## 四、补充：`disney_help_rag.py`（双路检索 + 全模态对话）调用关系图
+
+> 适用：`data/课程练习/RAG技术与应用/disney_help_rag.py`  
+> 特点：**文本向量（DashScope embedding + LangChain FAISS）** 与 **图片向量（CLIP + 原生 FAISS）** 两套索引；`ask` 默认进入 **百炼全模态对话**（`MultiModalConversation`）。
+
+```mermaid
+flowchart TB
+  subgraph disney["disney_help_rag.py"]
+    MAIN["main()"]
+    PARSER["_build_cli_parser()"]
+    ASK["_cmd_ask() 默认入口"]
+    RETR["_retrieve_dual_async()"]
+    TR["similarity_search_text_topk()"]
+    IR["similarity_search_image_topk_clip()"]
+    ROUTE_A["_gate_image_by_vector_a()"]
+    ROUTE_C["_route_need_image_local_c()"]
+    ROUTE_D["_text_suggests_need_image()"]
+    PROMPT["build_disney_rag_prompt()"]
+    OMNIU["build_disney_rag_omni_user_message()"]
+    LLM["generate_answer_with_dashscope()"]
+  end
+
+  subgraph ds["DashScope / 百炼"]
+    EMB["dashscope_embedding.get_dashscope_embeddings()"]
+    OMNICALL["bailian_omni_multimodal.call_omni_multimodal()"]
+    SDK["dashscope.MultiModalConversation.call"]
+    PARSE["bailian_omni_multimodal.omni_answer_text()"]
+  end
+
+  subgraph stores["本地向量库"]
+    TXT["LangChain FAISS (index.faiss/index.pkl)"]
+    IMG["faiss.IndexFlatL2 (images.index.faiss/images.index.pkl)"]
+  end
+
+  subgraph models["本地模型/工具"]
+    CLIP["CLIP: get_text_features / get_image_features"]
+    OCR["image_to_text (OCR)"]
+  end
+
+  MAIN --> PARSER --> ASK
+  ASK --> RETR
+  RETR --> TR --> TXT
+  TR --> EMB
+  RETR --> IR --> IMG
+  IR --> CLIP
+  IMG --> OCR
+
+  RETR --> ROUTE_A
+  RETR --> ROUTE_C
+  RETR --> ROUTE_D
+
+  ASK --> PROMPT
+  ASK --> OMNIU --> LLM --> OMNICALL --> SDK --> PARSE
+```
+
 （不含各函数体里的跨文件实现，只画**本文件**内的箭头。）
 
 ```mermaid

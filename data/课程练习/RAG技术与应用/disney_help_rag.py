@@ -9,7 +9,7 @@
 # Step3. 检索层
 # • 混合检索：文本查询使用语义相似度检索，图像查询使用CLIP文本编码器
 # • 关键词触发：检测特定关键词（如"海报"、"图片"）触发图像检索
-# Step4. 生成层：将检索到的上下文组织成结构化提示
+# Step4. 生成层：将检索到的上下文组织成结构化提示，并在 --use-llm 时走百炼全模态（附图 + 文本）
 
 from __future__ import annotations
 
@@ -38,8 +38,12 @@ from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
 
+from bailian_omni_multimodal import (
+    DEFAULT_OMNI_MODEL,
+    call_omni_multimodal,
+    omni_answer_text,
+)
 from dashscope_embedding import get_dashscope_embeddings, log_embedding_failure_hint
-from dashscope_generation import call_dashscope_chat, chat_answer_text
 from disney_classify import classify_disney_knowledge_files
 from doc_file_utils import (
     DEFAULT_WORD_CHUNK_METADATA_DEPARTMENT,
@@ -236,7 +240,7 @@ def build_disney_rag_prompt(
     max_context_chars: int = 8000,
 ) -> tuple[str, dict[str, Any]]:
     """
-    为最终调用大模型准备的 Prompt 构建方法（当前 demo 阶段只打印，不实际调用模型）。
+    为最终调用大模型准备的 Prompt 构建方法（与 ``build_disney_rag_omni_messages`` 共用同一套背景文本）。
 
     - 将文本向量召回结果 + 图片向量召回结果（含 OCR/路径）统一组织为结构化背景知识。
     - 控制背景知识长度，避免 prompt 过长（max_context_chars 仅裁剪背景，不裁剪系统指令/问题）。
@@ -335,18 +339,118 @@ def build_disney_rag_prompt(
     return prompt, debug
 
 
+def _resolve_image_path_for_omni(path_raw: str) -> Path | None:
+    """
+    将 metadata 中的 path_raw 解析为可读本地文件，供 MultiModalConversation 上传。
+    支持 http(s) 由调用方单独处理；相对路径依次尝试 cwd、知识库根、练习根。
+    """
+    raw = (path_raw or "").strip()
+    if not raw or raw.startswith(("http://", "https://")):
+        return None
+    candidates: list[Path] = [Path(raw)]
+    p0 = Path(raw)
+    if not p0.is_absolute():
+        candidates.extend(
+            [
+                Path.cwd() / raw,
+                _DISNEY_KNOWLEDGE_BASE / raw,
+                _PRACTICE_ROOT / raw,
+                Path(__file__).resolve().parent / raw,
+            ]
+        )
+    seen: set[str] = set()
+    for c in candidates:
+        key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            r = c.resolve()
+        except OSError:
+            continue
+        if r.is_file():
+            return r
+    return None
+
+
+def build_disney_rag_omni_user_message(
+    *,
+    query: str,
+    text_hits: list[dict[str, Any]] | None = None,
+    image_hits: list[dict[str, Any]] | None = None,
+    assistant_role: str = "迪士尼客服助手",
+    max_context_chars: int = 8000,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    仅构造本轮 ``user`` 消息（含 RAG 文本 + 可选附图），供多轮对话与 ``build_disney_rag_omni_messages`` 复用。
+    """
+    prompt, dbg = build_disney_rag_prompt(
+        query=query,
+        text_hits=text_hits,
+        image_hits=image_hits,
+        assistant_role=assistant_role,
+        max_context_chars=max_context_chars,
+    )
+    content: list[dict[str, Any]] = [{"text": (prompt or "").strip()}]
+    attached_paths: list[str] = []
+    for h in list(image_hits or []):
+        meta = h.get("metadata") or {}
+        raw = (meta.get("path_raw") or "").strip()
+        if not raw:
+            continue
+        if raw.startswith(("http://", "https://")):
+            content.append({"image": raw})
+            attached_paths.append(raw)
+            continue
+        resolved = _resolve_image_path_for_omni(raw)
+        if resolved is not None:
+            content.append({"image": str(resolved)})
+            attached_paths.append(str(resolved))
+    dbg = {
+        **dbg,
+        "omni_images_attached": len(attached_paths),
+        "omni_image_paths": attached_paths,
+    }
+    return {"role": "user", "content": content}, dbg
+
+
+def build_disney_rag_omni_messages(
+    *,
+    query: str,
+    text_hits: list[dict[str, Any]] | None = None,
+    image_hits: list[dict[str, Any]] | None = None,
+    assistant_role: str = "迪士尼客服助手",
+    max_context_chars: int = 8000,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    构造百炼全模态 ``MultiModalConversation`` 所需的 messages（单轮：system + 带 RAG 的 user）。
+    """
+    user_msg, dbg = build_disney_rag_omni_user_message(
+        query=query,
+        text_hits=text_hits,
+        image_hits=image_hits,
+        assistant_role=assistant_role,
+        max_context_chars=max_context_chars,
+    )
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": [{"text": f"你是{assistant_role}。"}]},
+        user_msg,
+    ]
+    return messages, dbg
+
+
 def generate_answer_with_dashscope(
     *,
-    prompt: str,
+    messages: list[dict[str, Any]],
     model: str,
     api_key: str | None = None,
+    **kwargs: Any,
 ) -> str:
     """
-    调用 DashScope 对话模型生成答案（复用 `dashscope_generation.py`，本文件不重复封装 SDK）。
+    调用百炼全模态对话（``bailian_omni_multimodal.call_omni_multimodal``）生成答案。
     """
-    messages = [{"role": "user", "content": (prompt or "").strip()}]
-    resp = call_dashscope_chat(messages, model=model, api_key=api_key)
-    return chat_answer_text(resp)
+    resp = call_omni_multimodal(messages, model=model, api_key=api_key, **kwargs)
+    return omni_answer_text(resp)
 
 
 def persist_image_vectors_to_faiss(
@@ -631,6 +735,18 @@ def _resolve_dashscope_api_key() -> str:
     ).strip()
 
 
+def _resolve_omni_chat_model(explicit: str) -> str:
+    """全模态对话模型：优先 CLI，其次 DASHSCOPE_OMNI_MODEL / DASHSCOPE_CHAT_MODEL，最后 DEFAULT_OMNI_MODEL。"""
+    x = (explicit or "").strip()
+    if x:
+        return x
+    return (
+        os.getenv("DASHSCOPE_OMNI_MODEL")
+        or os.getenv("DASHSCOPE_CHAT_MODEL")
+        or DEFAULT_OMNI_MODEL
+    ).strip()
+
+
 def _print_classification_summary(data: dict[str, list[str]]) -> None:
     """打印分类摘要与完整 JSON（中文保真）。"""
     print("迪士尼知识库文件分类统计：")
@@ -867,7 +983,18 @@ def _route_need_image_local_c(
     if not q:
         return False, "empty_query", 0.0
 
-    explicit = ("图片", "海报", "示意图", "地图", "路线", "二维码", "截图", "长什么样", "长啥样", "给我看")
+    explicit = (
+        "图片",
+        "海报",
+        "示意图",
+        "地图",
+        "路线",
+        "二维码",
+        "截图",
+        "长什么样",
+        "长啥样",
+        "给我看",
+    )
     for t in explicit:
         if t in q:
             return True, f"explicit:{t}", 1.0
@@ -910,7 +1037,11 @@ def _gate_image_by_vector_a(
     if not prefetch_hits:
         return False, "no_image_hits"
     d1 = float(prefetch_hits[0].get("l2_distance", 1e9))
-    d2 = float(prefetch_hits[1].get("l2_distance", 1e9)) if len(prefetch_hits) >= 2 else 1e9
+    d2 = (
+        float(prefetch_hits[1].get("l2_distance", 1e9))
+        if len(prefetch_hits) >= 2
+        else 1e9
+    )
     margin = d2 - d1
     if d1 <= float(l2_threshold):
         return True, f"img_l2<=T({d1:.3f}<={l2_threshold})"
@@ -1015,7 +1146,11 @@ async def _retrieve_dual_async(
         "route_mode": route_mode,
         "A": reason_a,
         "D": reason_d if need_d else "",
-        "C": f"{reason_c}({c_score:.3f})" if (route_mode or "").lower() == "acd" else "disabled",
+        "C": (
+            f"{reason_c}({c_score:.3f})"
+            if (route_mode or "").lower() == "acd"
+            else "disabled"
+        ),
     }
 
     if not need_image_full:
@@ -1037,9 +1172,19 @@ async def _retrieve_dual_async(
             top_k=image_k,
             index_name=image_index_name,
         )
-        return text_out, {"ok": True, "reason": route_reason, "hits": full_hits, "phase": "full"}
+        return text_out, {
+            "ok": True,
+            "reason": route_reason,
+            "hits": full_hits,
+            "phase": "full",
+        }
     except Exception as e:
-        return text_out, {"ok": False, "error": str(e), "reason": route_reason, "hits": []}
+        return text_out, {
+            "ok": False,
+            "error": str(e),
+            "reason": route_reason,
+            "hits": [],
+        }
 
 
 def _cmd_retrieve(args: argparse.Namespace) -> None:
@@ -1058,7 +1203,9 @@ def _cmd_retrieve(args: argparse.Namespace) -> None:
             "文本检索需要 DashScope API Key：请设置 BAILIAN_API_KEY 或 DASHSCOPE_API_KEY，"
             "或传入 --api-key（图片侧用 CLIP，不依赖该 Key）。"
         )
-    embedder = get_dashscope_embeddings(key, model=args.embedding_model or _EMBEDDING_MODEL)
+    embedder = get_dashscope_embeddings(
+        key, model=args.embedding_model or _EMBEDDING_MODEL
+    )
 
     text_out, image_out = asyncio.run(
         _retrieve_dual_async(
@@ -1079,29 +1226,40 @@ def _cmd_retrieve(args: argparse.Namespace) -> None:
         )
     )
     _print_retrieve_results(text_out, image_out, q=q, k=k, tag="retrieve")
+    prompt_max = int(getattr(args, "prompt_max_context_chars", 8000))
     if bool(getattr(args, "print_prompt", False)):
         prompt, dbg = build_disney_rag_prompt(
             query=q,
             text_hits=text_out.get("hits") or [],
             image_hits=image_out.get("hits") or [],
-            max_context_chars=int(getattr(args, "prompt_max_context_chars", 8000)),
+            max_context_chars=prompt_max,
         )
         print("[retrieve] --- Prompt Start ---")
         print(prompt)
         print("[retrieve] --- Prompt End ---")
         print(f"[retrieve] prompt_debug={dbg}")
-        if bool(getattr(args, "use_llm", False)):
-            key = (args.chat_api_key or "").strip() or _resolve_dashscope_api_key()
-            model = (args.chat_model or "").strip() or os.getenv("DASHSCOPE_CHAT_MODEL") or "qwen-turbo"
-            ans = generate_answer_with_dashscope(prompt=prompt, model=model, api_key=key or None)
-            print("[retrieve] --- LLM Answer ---")
-            print(ans)
+    if bool(getattr(args, "use_llm", False)):
+        key = (args.chat_api_key or "").strip() or _resolve_dashscope_api_key()
+        model = _resolve_omni_chat_model((args.chat_model or "").strip())
+        messages, dbg_omni = build_disney_rag_omni_messages(
+            query=q,
+            text_hits=text_out.get("hits") or [],
+            image_hits=image_out.get("hits") or [],
+            max_context_chars=prompt_max,
+        )
+        print(f"[retrieve] 全模态附图: {dbg_omni.get('omni_images_attached', 0)} 张")
+        ans = generate_answer_with_dashscope(
+            messages=messages, model=model, api_key=key or None
+        )
+        print("[retrieve] --- LLM Answer ---")
+        print(ans)
 
 
 def _cmd_ask(args: argparse.Namespace) -> None:
     """
-    交互式问答入口（不调大模型）：循环读取用户问题，对每问执行与 retrieve 相同的双路 Top-K 检索。
-    无子命令运行脚本时默认进入本模式。
+    交互式问答入口：每轮双路 Top-K 检索；默认调用百炼全模态，并在会话内保留多轮文本历史
+    （当前轮仍附带检索到的图片；历史轮仅保留问答文本以控制体积）。
+    无子命令运行脚本时默认进入本模式；``--no-use-llm`` 可改为仅检索。
     """
     load_dotenv()
     text_dir = Path(args.text_dir) if args.text_dir else _DISNEY_FAISS_DIR
@@ -1113,12 +1271,22 @@ def _cmd_ask(args: argparse.Namespace) -> None:
     key = (args.api_key or "").strip() or _resolve_dashscope_api_key()
     embedder: Embeddings | None
     if key:
-        embedder = get_dashscope_embeddings(key, model=args.embedding_model or _EMBEDDING_MODEL)
+        embedder = get_dashscope_embeddings(
+            key, model=args.embedding_model or _EMBEDDING_MODEL
+        )
     else:
         embedder = None
         print(
             "[ask] 未检测到 DashScope API Key，将跳过文本向量检索，仅执行图片 CLIP 检索。"
         )
+
+    _assistant_role = "迪士尼客服助手"
+    _system_omni: dict[str, Any] = {
+        "role": "system",
+        "content": [{"text": f"你是{_assistant_role}。"}],
+    }
+    # 多轮对话：历史轮次仅存纯文本 user/assistant，避免重复传图
+    _history_textual: list[dict[str, Any]] = []
 
     def _one_round(question: str) -> None:
         q = question.strip()
@@ -1143,23 +1311,53 @@ def _cmd_ask(args: argparse.Namespace) -> None:
             )
         )
         _print_retrieve_results(text_out, image_out, q=q, k=k, tag="ask")
+        prompt_max = int(getattr(args, "prompt_max_context_chars", 8000))
         if bool(getattr(args, "print_prompt", False)):
             prompt, dbg = build_disney_rag_prompt(
                 query=q,
                 text_hits=text_out.get("hits") or [],
                 image_hits=image_out.get("hits") or [],
-                max_context_chars=int(getattr(args, "prompt_max_context_chars", 8000)),
+                max_context_chars=prompt_max,
             )
             print("[ask] --- Prompt Start ---")
             print(prompt)
             print("[ask] --- Prompt End ---")
             print(f"[ask] prompt_debug={dbg}")
-            if bool(getattr(args, "use_llm", False)):
-                key = (args.chat_api_key or "").strip() or _resolve_dashscope_api_key()
-                model = (args.chat_model or "").strip() or os.getenv("DASHSCOPE_CHAT_MODEL") or "qwen-turbo"
-                ans = generate_answer_with_dashscope(prompt=prompt, model=model, api_key=key or None)
-                print("[ask] --- LLM Answer ---")
-                print(ans)
+        use_llm = bool(getattr(args, "use_llm", True))
+        if use_llm:
+            chat_key = (args.chat_api_key or "").strip() or _resolve_dashscope_api_key()
+            if not chat_key:
+                print(
+                    "[ask] 未配置对话 API Key（BAILIAN_API_KEY / DASHSCOPE_API_KEY 或 --chat-api-key），"
+                    "无法调用全模态。可改用 --no-use-llm 仅检索。"
+                )
+                return
+            model = _resolve_omni_chat_model((args.chat_model or "").strip())
+            user_rag, dbg_omni = build_disney_rag_omni_user_message(
+                query=q,
+                text_hits=text_out.get("hits") or [],
+                image_hits=image_out.get("hits") or [],
+                assistant_role=_assistant_role,
+                max_context_chars=prompt_max,
+            )
+            messages = [_system_omni] + _history_textual + [user_rag]
+            print(f"[ask] 全模态附图: {dbg_omni.get('omni_images_attached', 0)} 张")
+            try:
+                ans = generate_answer_with_dashscope(
+                    messages=messages, model=model, api_key=chat_key or None
+                )
+            except Exception as e:
+                print("[ask] 全模态调用失败：", e)
+                print(
+                    "[ask] 可能原因：当前账号/Key 未开通该模型权限（403 Access denied）。"
+                    "可尝试：1) 换有权限的模型：--chat-model qwen-vl-plus；"
+                    "2) 在百炼控制台开通/授权该模型；3) 临时用 --no-use-llm 仅检索。"
+                )
+                return
+            print("[ask] --- 助手 ---")
+            print(ans)
+            _history_textual.append({"role": "user", "content": [{"text": q}]})
+            _history_textual.append({"role": "assistant", "content": [{"text": ans}]})
 
     preset = (getattr(args, "query", None) or "").strip()
     if preset:
@@ -1167,7 +1365,8 @@ def _cmd_ask(args: argparse.Namespace) -> None:
         return
 
     print(
-        "[ask] 输入问题后回车检索（文本+图片 Top-K）；空行忽略；输入 quit / exit / q 结束。"
+        "[ask] 输入问题后回车：检索 + 默认全模态回答；多轮对话会带上文本人历史。"
+        "空行忽略；quit / exit / q 结束。仅检索请加 --no-use-llm。"
     )
     while True:
         try:
@@ -1183,13 +1382,18 @@ def _cmd_ask(args: argparse.Namespace) -> None:
 
 def _cmd_build_all(args: argparse.Namespace) -> None:
     """默认构建：文本 + 图片。"""
+
     # 并发执行：两边都跑完后再汇总；任一失败不阻断另一方。
     async def _run() -> tuple[dict[str, Any], dict[str, Any]]:
         async def _wrap(name: str, fn) -> dict[str, Any]:
             t0 = time.perf_counter()
             try:
                 await asyncio.to_thread(fn, args)
-                return {"ok": True, "task": name, "ms": (time.perf_counter() - t0) * 1000.0}
+                return {
+                    "ok": True,
+                    "task": name,
+                    "ms": (time.perf_counter() - t0) * 1000.0,
+                }
             except Exception as e:
                 return {
                     "ok": False,
@@ -1246,7 +1450,7 @@ def _default_ask_namespace() -> argparse.Namespace:
         c_min_lexical_score=0.12,
         print_prompt=False,
         prompt_max_context_chars=8000,
-        use_llm=False,
+        use_llm=True,
         chat_model="",
         chat_api_key="",
     )
@@ -1585,13 +1789,16 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     p_retrieve.add_argument(
         "--use-llm",
         action="store_true",
-        help="在打印 Prompt 后调用 DashScope 对话模型生成最终回答",
+        help="在打印 Prompt 后调用百炼全模态 MultiModalConversation 生成回答（附图 + 文本）",
     )
     p_retrieve.add_argument(
         "--chat-model",
         type=str,
         default="",
-        help="对话模型名（默认环境变量 DASHSCOPE_CHAT_MODEL 或 'qwen-turbo'）",
+        help=(
+            "全模态模型名（默认环境变量 DASHSCOPE_OMNI_MODEL 或 DASHSCOPE_CHAT_MODEL，"
+            f"再否则 {DEFAULT_OMNI_MODEL!r}）"
+        ),
     )
     p_retrieve.add_argument(
         "--chat-api-key",
@@ -1603,7 +1810,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 
     p_ask = sub.add_parser(
         "ask",
-        help="交互式双路检索：循环输入问题（也可单次传入 query）；默认无子命令时进入本模式",
+        help="交互式双路检索 + 默认全模态对话；无子命令时同此模式（--no-use-llm 可仅检索）",
     )
     p_ask.add_argument(
         "query",
@@ -1700,14 +1907,18 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     )
     p_ask.add_argument(
         "--use-llm",
-        action="store_true",
-        help="在打印 Prompt 后调用 DashScope 对话模型生成最终回答",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否调用百炼全模态（默认开启；--no-use-llm 仅检索）",
     )
     p_ask.add_argument(
         "--chat-model",
         type=str,
         default="",
-        help="对话模型名（默认环境变量 DASHSCOPE_CHAT_MODEL 或 'qwen-turbo'）",
+        help=(
+            "全模态模型名（默认环境变量 DASHSCOPE_OMNI_MODEL 或 DASHSCOPE_CHAT_MODEL，"
+            f"再否则 {DEFAULT_OMNI_MODEL!r}）"
+        ),
     )
     p_ask.add_argument(
         "--chat-api-key",
@@ -1726,14 +1937,9 @@ def main(argv: list[str] | None = None) -> None:
     if getattr(args, "handler", None) is not None:
         args.handler(args)
         return
-    # 未指定子命令：默认进入 ask 交互检索（不调大模型）
+    # 未指定子命令：默认进入 ask 交互（检索 + 全模态对话）
     _cmd_ask(_default_ask_namespace())
 
 
 if __name__ == "__main__":
     main()
-
-    # for image_path in classified["images"]:
-    #     img_text_info = image_to_text(str(_DISNEY_KNOWLEDGE_BASE / image_path))
-
-    #     print(img_text_info)
