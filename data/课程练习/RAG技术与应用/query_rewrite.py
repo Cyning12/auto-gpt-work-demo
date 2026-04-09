@@ -351,37 +351,353 @@ class QueryRewrite:
 
         # 根据识别结果调用相应的改写方法
         query_type = result.get("query_type", "")
+        err: str = ""
 
-        if "上下文依赖" in query_type:
-            final_result = self.rewrite_context_dependent_query(
-                query, conversation_history
-            )
-        elif "对比" in query_type:
-            final_result = self.rewrite_comparative_query(
-                query, context_info or conversation_history
-            )
-        elif "模糊指代" in query_type:
-            final_result = self.rewrite_ambiguous_reference_query(
-                query, conversation_history
-            )
-        elif "多意图" in query_type:
-            final_result = self.rewrite_multi_intent_query(query)
-        elif "反问" in query_type:
-            final_result = self.rewrite_rhetorical_query(query, conversation_history)
-        else:
-            # 对于其他类型，返回自动识别的改写结果
+        try:
+            if "上下文依赖" in query_type:
+                final_result = self.rewrite_context_dependent_query(
+                    query, conversation_history
+                )
+            elif "对比" in query_type:
+                final_result = self.rewrite_comparative_query(
+                    query, context_info or conversation_history
+                )
+            elif "模糊指代" in query_type:
+                final_result = self.rewrite_ambiguous_reference_query(
+                    query, conversation_history
+                )
+            elif "多意图" in query_type:
+                final_result = self.rewrite_multi_intent_query(query)
+            elif "反问" in query_type:
+                final_result = self.rewrite_rhetorical_query(
+                    query, conversation_history
+                )
+            else:
+                # 对于其他类型，返回自动识别的改写结果
+                final_result = result.get("rewritten_query", query)
+        except Exception as e:
+            # Demo 兜底：网络/配额/解析异常时不阻断流程
+            err = str(e)
             final_result = result.get("rewritten_query", query)
 
-        return {
+        out = {
             "original_query": query,
             "detected_type": query_type,
             "confidence": result.get("confidence", 0.5),
             "rewritten_query": final_result,
             "auto_rewrite_result": result,
         }
+        if err:
+            out["execute_error"] = err
+        return out
+
+    def auto_web_search_rewrite(self, query, conversation_history="", context_info=""):
+        """自动识别并改写为联网搜索查询（仅给出是否需要搜索 + 查询改写 + 搜索策略，不实际联网）。"""
+        # 第一步：识别是否需要联网搜索
+        search_analysis = self.identify_web_search_needs(
+            query, conversation_history=conversation_history, context_info=context_info
+        )
+
+        if not bool(search_analysis.get("need_web_search", False)):
+            return {
+                "need_web_search": False,
+                "reason": str(
+                    search_analysis.get("reason") or "查询不需要联网搜索"
+                ).strip(),
+                "confidence": float(search_analysis.get("confidence") or 0.7),
+                "original_query": query,
+            }
+
+        # 第二步：改写查询
+        rewritten_result = self.rewrite_for_web_search(
+            query, conversation_history=conversation_history, context_info=context_info
+        )
+
+        # 第三步：生成搜索策略
+        search_strategy = self.generate_search_strategy(
+            query,
+            rewritten_query=rewritten_result.get("rewritten_query", query),
+        )
+
+        return {
+            "need_web_search": True,
+            "search_reason": str(search_analysis.get("search_reason") or "").strip(),
+            "confidence": float(search_analysis.get("confidence") or 0.7),
+            "original_query": query,
+            "rewritten_query": str(
+                rewritten_result.get("rewritten_query") or query
+            ).strip(),
+            "search_keywords": list(rewritten_result.get("search_keywords") or []),
+            "search_intent": str(rewritten_result.get("search_intent") or "").strip(),
+            "suggested_sources": list(rewritten_result.get("suggested_sources") or []),
+            "search_strategy": dict(search_strategy or {}),
+        }
+
+    def identify_web_search_needs(
+        self,
+        query: str,
+        *,
+        conversation_history: str = "",
+        context_info: str = "",
+    ) -> dict:
+        """
+        判断是否需要联网搜索（面向“缺少最新信息/实时数据/外部事实核验”等场景）。
+
+        返回 JSON 对象：
+        {
+          "need_web_search": true/false,
+          "search_reason": "...",   # need_web_search=true 时必填
+          "reason": "...",          # need_web_search=false 时必填
+          "confidence": 0.0-1.0
+        }
+        """
+        q = (query or "").strip()
+        hist = (conversation_history or "").strip()
+        ctx = (context_info or "").strip()
+        if not q:
+            return {
+                "need_web_search": False,
+                "reason": "空查询无需联网搜索",
+                "confidence": 1.0,
+            }
+        system = (
+            "你是一个联网搜索需求判定器。你的任务是判断用户问题是否必须联网搜索才能可靠回答。\n"
+            "必须联网搜索的典型：实时/最新（今天/本周/2026/最近）、价格/库存/开放时间/活动排期、"
+            "政策变更、新闻、需要核验的外部事实。\n"
+            "不需要联网搜索的典型：常识、对话内已给出信息、用户只是在改写/澄清意图。\n"
+            "输出要求：只输出严格 JSON 对象，不要解释文字。\n"
+        )
+        user = f"""
+【对话历史】
+{hist}
+
+【上下文信息】
+{ctx}
+
+【用户问题】
+{q}
+
+请输出 JSON：
+{{
+  "need_web_search": true/false,
+  "search_reason": "需要搜索时填写，说明缺什么外部信息",
+  "reason": "不需要搜索时填写，说明为什么不需要",
+  "confidence": 0.0
+}}
+"""
+        try:
+            obj = self._call_rewrite_model(
+                system=system, user=user, output_format="json_object"
+            )
+            need = bool(obj.get("need_web_search"))
+            try:
+                cf = float(obj.get("confidence"))
+            except Exception:
+                cf = 0.7
+            out = {
+                "need_web_search": need,
+                "confidence": max(0.0, min(1.0, cf)),
+            }
+            if need:
+                out["search_reason"] = str(obj.get("search_reason") or "").strip()
+                if not out["search_reason"]:
+                    out["search_reason"] = "需要联网获取最新/实时信息"
+            else:
+                out["reason"] = str(obj.get("reason") or "").strip()
+                if not out["reason"]:
+                    out["reason"] = "该问题可在本地知识库/常识范围内回答"
+            return out
+        except Exception:
+            # 兜底：用启发式判断（包含“最新/今天/本周/价格/活动”等词就倾向需要）
+            cues = (
+                "最新",
+                "最近",
+                "今天",
+                "本周",
+                "价格",
+                "票价",
+                "活动",
+                "开放时间",
+                "排期",
+                "新闻",
+            )
+            if any(c in q for c in cues):
+                return {
+                    "need_web_search": True,
+                    "search_reason": "问题包含明显的“最新/实时/价格/活动”信息需求",
+                    "confidence": 0.6,
+                }
+            return {
+                "need_web_search": False,
+                "reason": "问题不强依赖外部实时信息",
+                "confidence": 0.6,
+            }
+
+    def rewrite_for_web_search(
+        self,
+        query: str,
+        *,
+        conversation_history: str = "",
+        context_info: str = "",
+    ) -> dict:
+        """
+        将原始 query 改写为更适合搜索引擎的查询，并产出关键词/意图/建议来源。
+
+        返回 JSON：
+        {
+          "rewritten_query": "...",
+          "search_keywords": ["...", "..."],
+          "search_intent": "...",
+          "suggested_sources": ["..."]
+        }
+        """
+        q = (query or "").strip()
+        hist = (conversation_history or "").strip()
+        ctx = (context_info or "").strip()
+        if not q:
+            return {
+                "rewritten_query": "",
+                "search_keywords": [],
+                "search_intent": "",
+                "suggested_sources": [],
+            }
+        system = (
+            "你是搜索 Query 改写器。把用户问题改写为适合搜索引擎检索的中文查询。\n"
+            "要求：\n"
+            "1) 只输出严格 JSON 对象，不要解释文字。\n"
+            "2) rewritten_query 要尽量包含地点/对象/时间范围等限定。\n"
+            "3) search_keywords 给 3-8 个关键词，尽量去冗余。\n"
+        )
+        user = f"""
+【对话历史】
+{hist}
+
+【上下文信息】
+{ctx}
+
+【原始问题】
+{q}
+
+请输出 JSON：
+{{
+  "rewritten_query": "...",
+  "search_keywords": ["..."],
+  "search_intent": "一句话说明要搜什么",
+  "suggested_sources": ["官网", "权威媒体", "票务平台", "地图/点评平台"]
+}}
+"""
+        try:
+            obj = self._call_rewrite_model(
+                system=system, user=user, output_format="json_object"
+            )
+            rq = str(obj.get("rewritten_query") or "").strip() or q
+            kws = obj.get("search_keywords") or []
+            if not isinstance(kws, list):
+                kws = [str(kws)]
+            kws2: list[str] = []
+            for x in kws:
+                s = self._clean_one_line_text(str(x))
+                if s:
+                    kws2.append(s)
+            intent = str(obj.get("search_intent") or "").strip()
+            srcs = obj.get("suggested_sources") or []
+            if not isinstance(srcs, list):
+                srcs = [str(srcs)]
+            srcs2 = [self._clean_one_line_text(str(x)) for x in srcs if str(x).strip()]
+            return {
+                "rewritten_query": rq,
+                "search_keywords": kws2,
+                "search_intent": intent,
+                "suggested_sources": srcs2,
+            }
+        except Exception:
+            return {
+                "rewritten_query": q,
+                "search_keywords": [],
+                "search_intent": "",
+                "suggested_sources": [],
+            }
+
+    def generate_search_strategy(
+        self,
+        query: str,
+        *,
+        rewritten_query: str = "",
+    ) -> dict:
+        """
+        给出搜索策略（不联网）：关键词拆分、平台建议、时间范围。
+
+        返回 dict：
+        {
+          "primary_keywords": [...],
+          "extended_keywords": [...],
+          "search_platforms": [...],
+          "time_range": "..."
+        }
+        """
+        q = (query or "").strip()
+        rq = (rewritten_query or "").strip()
+        base = rq or q
+        if not base:
+            return {
+                "primary_keywords": [],
+                "extended_keywords": [],
+                "search_platforms": [],
+                "time_range": "",
+            }
+        system = (
+            "你是搜索策略助手。请为搜索引擎查询生成可执行的搜索策略。\n"
+            "输出要求：只输出严格 JSON 对象，不要解释文字。\n"
+        )
+        user = f"""
+【查询】
+{base}
+
+请输出 JSON：
+{{
+  "primary_keywords": ["..."],
+  "extended_keywords": ["..."],
+  "search_platforms": ["Google", "Bing", "百度", "官网", "社交媒体"],
+  "time_range": "例如：最近7天/2026年/不限"
+}}
+"""
+        try:
+            obj = self._call_rewrite_model(
+                system=system, user=user, output_format="json_object"
+            )
+            pk = obj.get("primary_keywords") or []
+            ek = obj.get("extended_keywords") or []
+            sp = obj.get("search_platforms") or []
+            tr = str(obj.get("time_range") or "").strip()
+            if not isinstance(pk, list):
+                pk = [str(pk)]
+            if not isinstance(ek, list):
+                ek = [str(ek)]
+            if not isinstance(sp, list):
+                sp = [str(sp)]
+            return {
+                "primary_keywords": [
+                    self._clean_one_line_text(str(x)) for x in pk if str(x).strip()
+                ],
+                "extended_keywords": [
+                    self._clean_one_line_text(str(x)) for x in ek if str(x).strip()
+                ],
+                "search_platforms": [
+                    self._clean_one_line_text(str(x)) for x in sp if str(x).strip()
+                ],
+                "time_range": tr,
+            }
+        except Exception:
+            return {
+                "primary_keywords": [],
+                "extended_keywords": [],
+                "search_platforms": [],
+                "time_range": "",
+            }
 
 
-def main():
+def query_rewrite_demo() -> None:
+    """Demo：自动识别 Query 类型并执行对应改写策略（case1..case6）。"""
     query_rewrite = QueryRewrite()
 
     def _print_case(title: str, payload: dict) -> None:
@@ -391,7 +707,6 @@ def main():
         print(f"- confidence: {payload.get('confidence')}")
         print(f"- rewritten_query: {payload.get('rewritten_query')}")
 
-    # 一个不同类型的 query 对应一个示例方法（caseX）
     def case1_context_dependent() -> None:
         conversation_history = """
 用户: 我想了解一下上海迪士尼乐园的最新项目。
@@ -453,19 +768,54 @@ def main():
     case6_other()
 
 
-#     conversation_history = """
-# 用户: "我想了解一下上海迪士尼乐园的最新项目。"
-# AI: "上海迪士尼乐园最新推出了'疯狂动物城'主题园区，这里有朱迪警官和尼克狐的互动体验。"
-# 用户: "这个园区有什么游乐设施？"
-# AI: "'疯狂动物城'园区目前有疯狂动物城警察局、朱迪警官训练营和尼克狐的冰淇淋店等设施。"
-# """
-#     current_query = "还有其他设施吗？"
-#     print(
-#         query_rewrite.rewrite_context_dependent_query(
-#             current_query,
-#             conversation_history,
-#         )
-#     )
+def auto_web_search_rewrite_demo() -> None:
+    """Demo：判断是否需要联网搜索，并打印结构化日志（不实际搜索）。"""
+    qr = QueryRewrite()
+
+    def _print_result(title: str, result2: dict) -> None:
+        print(f"\n{title}")
+        if bool(result2.get("need_web_search")):
+            print("✓ 需要联网搜索")
+            print(f"  搜索原因: {result2.get('search_reason')}")
+            print(f"  置信度: {result2.get('confidence')}")
+            print(f"  改写查询: {result2.get('rewritten_query')}")
+            print(f"  搜索关键词: {result2.get('search_keywords')}")
+            print(f"  搜索意图: {result2.get('search_intent')}")
+            print(f"  建议来源: {result2.get('suggested_sources')}")
+            ss = result2.get("search_strategy") or {}
+            print("  搜索策略:")
+            print(f"    - 主要关键词: {ss.get('primary_keywords')}")
+            print(f"    - 扩展关键词: {ss.get('extended_keywords')}")
+            print(f"    - 搜索平台: {ss.get('search_platforms')}")
+            print(f"    - 时间范围: {ss.get('time_range')}")
+        else:
+            print("✗ 不需要联网搜索")
+            print(f"  原因: {result2.get('reason')}")
+            print(f"  置信度: {result2.get('confidence')}")
+            print(f"  原始查询: {result2.get('original_query')}")
+
+    def case1_need_search() -> None:
+        query = "2026年上海迪士尼最近有什么活动？票价有变化吗？"
+        r = qr.auto_web_search_rewrite(query)
+        _print_result("case1（应需要联网）", r)
+
+    def case2_no_search() -> None:
+        conversation_history = """
+用户: 我想了解一下“疯狂动物城”主题园区。
+助手: 目前园区包含沉浸式街区与互动体验。
+""".strip()
+        query = "这个园区有什么游乐设施？"
+        r = qr.auto_web_search_rewrite(query, conversation_history=conversation_history)
+        _print_result("case2（应不需要联网）", r)
+
+    case1_need_search()
+    case2_no_search()
+
+
+def main():
+    # 先跑 query rewrite demo，再跑 web search rewrite demo
+    # query_rewrite_demo()
+    auto_web_search_rewrite_demo()
 
 
 if __name__ == "__main__":
