@@ -35,9 +35,7 @@ _logger = logging.getLogger(__name__)
 
 def get_dashscope_api_key_from_env() -> str:
     """从环境变量读取 API Key（百炼 / DashScope 二选一）。"""
-    key = (
-        os.getenv("BAILIAN_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or ""
-    ).strip()
+    key = (os.getenv("BAILIAN_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or "").strip()
     if not key:
         raise RuntimeError(
             "未配置 API Key：请在环境变量或 .env 中设置 BAILIAN_API_KEY 或 DASHSCOPE_API_KEY"
@@ -160,9 +158,41 @@ def chat_answer_text(response: Any) -> str:
     content = (
         msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
     )
-    if not content:
-        raise RuntimeError("DashScope 返回的 assistant message 无 content")
-    return str(content).strip()
+    if content:
+        # 兼容 content 为多块（少见）：拼接 text
+        if isinstance(content, list):
+            parts: list[str] = []
+            for it in content:
+                if isinstance(it, dict):
+                    t = it.get("text")
+                    if t:
+                        parts.append(str(t))
+                elif isinstance(it, str) and it.strip():
+                    parts.append(it.strip())
+            if parts:
+                return "\n".join(parts).strip()
+        return str(content).strip()
+
+    # 兜底：部分返回可能把文本放在 output.text（而非 choices.message.content）
+    output = (
+        response.get("output")
+        if hasattr(response, "get")
+        else getattr(response, "output", None)
+    )
+    if output is not None:
+        text = (
+            output.get("text")
+            if hasattr(output, "get")
+            else getattr(output, "text", None)
+        )
+        if text:
+            return str(text).strip()
+
+    code = getattr(response, "status_code", None)
+    msg_err = getattr(response, "message", None)
+    raise RuntimeError(
+        f"DashScope 返回的 assistant message 无 content（status_code={code!r}, message={msg_err!r}）"
+    )
 
 
 def call_generation_can_search(
@@ -245,7 +275,19 @@ def call_generation_can_search(
                 }
             )
 
+        # DashScope 可能返回 function_call 或 tool_calls（OpenAI 风格）
         fc = message_function_call(msg)
+        if not fc and isinstance(msg, dict):
+            tc = msg.get("tool_calls")
+            if isinstance(tc, list) and tc:
+                first = tc[0] if isinstance(tc[0], dict) else None
+                if first and (first.get("type") == "function" or "function" in first):
+                    fn = first.get("function") or {}
+                    if isinstance(fn, dict):
+                        fc = {
+                            "name": fn.get("name"),
+                            "arguments": fn.get("arguments"),
+                        }
         if not fc:
             _logger.info("call_generation_can_search: done (no tool call)")
             return resp, msgs
@@ -254,11 +296,19 @@ def call_generation_can_search(
         turns += 1
 
         name = fc.get("name") if isinstance(fc, dict) else getattr(fc, "name", "")
-        args_raw = fc.get("arguments") if isinstance(fc, dict) else getattr(fc, "arguments", "")
+        args_raw = (
+            fc.get("arguments")
+            if isinstance(fc, dict)
+            else getattr(fc, "arguments", "")
+        )
         if name != "web_search":
             raise RuntimeError(f"不支持的 function_call: {name!r}")
         try:
-            args = json.loads(args_raw) if isinstance(args_raw, str) and args_raw.strip() else {}
+            args = (
+                json.loads(args_raw)
+                if isinstance(args_raw, str) and args_raw.strip()
+                else {}
+            )
         except Exception as e:
             raise RuntimeError(f"web_search arguments 解析失败: {args_raw!r}") from e
 

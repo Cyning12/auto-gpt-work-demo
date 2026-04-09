@@ -9,6 +9,7 @@ if str(_PRACTICE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PRACTICE_ROOT))
 
 import os
+import logging
 from dotenv import load_dotenv
 import json
 import re
@@ -969,6 +970,8 @@ def auto_web_search_rewrite_demo_with_search_function_call():
     - 日志：`dashscope_generation.call_generation_can_search` 内部会打印 tool_call 相关日志（需 INFO 级别）。
     """
     print("\n=== auto_web_search_rewrite_demo_with_search_function_call ===")
+    # Demo 默认打开 INFO 日志，确保能看到 functioncall/web_search 的调用日志
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     load_dotenv()
     question = "2026年上海迪士尼最近有什么活动？票价有变化吗？请给出来源链接。"
 
