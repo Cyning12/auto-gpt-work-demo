@@ -12,8 +12,14 @@ import os
 from dotenv import load_dotenv
 import json
 import re
-from dashscope_generation import call_generation
+from dashscope_generation import (
+    call_dashscope_chat,
+    call_generation,
+    call_generation_can_search,
+    chat_answer_text,
+)
 from utils import generation_first_message
+from web_search import search_web
 
 load_dotenv()
 _api_key = (
@@ -433,6 +439,84 @@ class QueryRewrite:
             "search_strategy": dict(search_strategy or {}),
         }
 
+    @staticmethod
+    def format_web_search_context(tavily_response: dict) -> str:
+        """
+        将 Tavily search response 格式化为可直接喂给 LLM 的上下文文本。
+        这里先不做内容筛选，仅做轻量排版与截断，避免 token 爆炸。
+        """
+        if not isinstance(tavily_response, dict):
+            return ""
+        results = tavily_response.get("results") or []
+        if not isinstance(results, list) or not results:
+            return ""
+
+        blocks: list[str] = []
+        for i, item in enumerate(results, start=1):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            content = str(item.get("content") or "").strip()
+            # 不做筛选，只做长度控制
+            if len(content) > 800:
+                content = content[:800] + "..."
+            blocks.append(
+                "\n".join(
+                    [
+                        f"[{i}] {title}" if title else f"[{i}]",
+                        f"URL: {url}" if url else "URL: （空）",
+                        f"摘要: {content}" if content else "摘要: （空）",
+                    ]
+                )
+            )
+        return "\n\n".join(blocks).strip()
+
+    def answer_with_web_search(
+        self,
+        *,
+        user_question: str,
+        tavily_response: dict,
+        model: str | None = None,
+    ) -> str:
+        """
+        format_context -> call_dashscope_chat -> answer
+        说明：不做内容筛选，直接把搜索结果上下文交给 LLM 整合回答。
+        """
+        q = (user_question or "").strip()
+        if not q:
+            return ""
+        ctx = self.format_web_search_context(tavily_response)
+        if not ctx:
+            raise RuntimeError("搜索结果为空，无法生成回答")
+
+        sys_prompt = (
+            "你是一个智能助手，负责根据联网搜索结果回答用户问题。\n"
+            "回答原则：\n"
+            "1) 只基于“搜索结果”里的事实回答，不要编造。\n"
+            "2) 信息不足时，明确说明不足，并指出你缺少哪类信息。\n"
+            "3) 给出结论后，可用 2-5 条要点补充细节。\n"
+            "4) 涉及时效信息（活动/票价/开放时间等），请说明信息可能随时间变化。\n"
+            "5) 尽量在答案末尾给出引用来源（URL 列表或编号）。\n"
+        )
+        user_prompt = (
+            f"用户问题：{q}\n\n"
+            "搜索结果（可引用编号）：\n"
+            f"{ctx}\n\n"
+            "请基于以上搜索结果回答。"
+        )
+
+        m = (model or "").strip() or os.getenv("DASHSCOPE_CHAT_MODEL") or self._model
+        resp = call_dashscope_chat(
+            [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            model=m,
+            api_key=self._api_key,
+        )
+        return chat_answer_text(resp)
+
     def identify_web_search_needs(
         self,
         query: str,
@@ -769,7 +853,7 @@ def query_rewrite_demo() -> None:
 
 
 def auto_web_search_rewrite_demo() -> None:
-    """Demo：判断是否需要联网搜索，并打印结构化日志（不实际搜索）。"""
+    """Demo：判断是否需要联网搜索，并打印结构化日志（需要时可实际联网搜索）。"""
     qr = QueryRewrite()
 
     def _print_result(title: str, result2: dict) -> None:
@@ -788,6 +872,70 @@ def auto_web_search_rewrite_demo() -> None:
             print(f"    - 扩展关键词: {ss.get('extended_keywords')}")
             print(f"    - 搜索平台: {ss.get('search_platforms')}")
             print(f"    - 时间范围: {ss.get('time_range')}")
+            # 可选：真的去搜（Tavily）
+            enabled = str(
+                os.getenv("WEB_SEARCH_ENABLED") or "1"
+            ).strip().lower() not in (
+                "0",
+                "false",
+                "off",
+            )
+            if enabled:
+                q2 = str(result2.get("rewritten_query") or "").strip()
+                kw = result2.get("search_keywords") or []
+                query_for_search = q2 or (
+                    " ".join([str(x) for x in kw if str(x).strip()]) or ""
+                )
+                if query_for_search:
+                    try:
+                        data = search_web(
+                            query_for_search,
+                            max_results=int(os.getenv("WEB_SEARCH_MAX_RESULTS") or 5),
+                            search_depth=str(os.getenv("WEB_SEARCH_DEPTH") or "basic"),
+                            time_range=(
+                                os.getenv("WEB_SEARCH_TIME_RANGE") or ""
+                            ).strip()
+                            or None,
+                            start_date=(
+                                os.getenv("WEB_SEARCH_START_DATE") or ""
+                            ).strip()
+                            or None,
+                            end_date=(os.getenv("WEB_SEARCH_END_DATE") or "").strip()
+                            or None,
+                            include_answer=False,
+                            include_raw_content=False,
+                        )
+                        results = data.get("results") or []
+                        print(f"  搜索结果: {len(results)} 条（Tavily）")
+                        for i, item in enumerate(results[:3], start=1):
+                            title2 = (item.get("title") or "").strip()
+                            url2 = (item.get("url") or "").strip()
+                            snippet = (item.get("content") or "").strip()
+                            snippet = snippet[:140] + (
+                                "..." if len(snippet) > 140 else ""
+                            )
+                            print(f"    [{i}] {title2}")
+                            print(f"        {url2}")
+                            if snippet:
+                                print(f"        {snippet}")
+                        # LLM 整合搜索结果输出最终回答
+                        try:
+                            ans = qr.answer_with_web_search(
+                                user_question=str(
+                                    result2.get("original_query") or query_for_search
+                                ),
+                                tavily_response=data,
+                            )
+                            print("  --- LLM Answer ---")
+                            print(ans)
+                        except Exception as e2:
+                            print(f"  生成回答失败: {e2}")
+                    except Exception as e:
+                        print(f"  搜索失败: {e}")
+                else:
+                    print("  搜索跳过: 改写查询/关键词为空")
+            else:
+                print("  搜索跳过: WEB_SEARCH_ENABLED=0")
         else:
             print("✗ 不需要联网搜索")
             print(f"  原因: {result2.get('reason')}")
@@ -812,10 +960,51 @@ def auto_web_search_rewrite_demo() -> None:
     case2_no_search()
 
 
+def auto_web_search_rewrite_demo_with_search_function_call():
+    """
+    Demo：让 LLM 通过 Function Calling 自动触发 web_search 工具，再基于工具结果回答。
+
+    说明：
+    - 本 Demo 不走 auto_web_search_rewrite 的“判定/改写/策略”链路，直接让模型自主决定是否调用 web_search。
+    - 日志：`dashscope_generation.call_generation_can_search` 内部会打印 tool_call 相关日志（需 INFO 级别）。
+    """
+    print("\n=== auto_web_search_rewrite_demo_with_search_function_call ===")
+    load_dotenv()
+    question = "2026年上海迪士尼最近有什么活动？票价有变化吗？请给出来源链接。"
+
+    system = (
+        "你是一个带工具的智能助手。\n"
+        "当用户问题涉及最新/实时/价格/活动/开放时间等外部信息时，你必须先调用 web_search 工具获取资料；\n"
+        "如果不需要搜索，也要说明原因。\n"
+        "回答要求：\n"
+        "1) 先给结论，再给要点。\n"
+        "2) 给出来源（URL 或编号）。\n"
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": question},
+    ]
+
+    resp, trace = call_generation_can_search(
+        model=os.getenv("DASHSCOPE_CHAT_MODEL") or "qwen-turbo",
+        messages=messages,
+        api_key=(os.getenv("BAILIAN_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or "").strip()
+        or None,
+        search_max_results=int(os.getenv("WEB_SEARCH_MAX_RESULTS") or 6),
+        search_depth=str(os.getenv("WEB_SEARCH_DEPTH") or "advanced"),
+    )
+    print("✓ 对话完成")
+    print(f"- trace_messages: {len(trace)}")
+    print("---- Answer ----")
+    print(chat_answer_text(resp))
+
+
 def main():
     # 先跑 query rewrite demo，再跑 web search rewrite demo
     # query_rewrite_demo()
-    auto_web_search_rewrite_demo()
+    # auto_web_search_rewrite_demo()
+    auto_web_search_rewrite_demo_with_search_function_call()
 
 
 if __name__ == "__main__":

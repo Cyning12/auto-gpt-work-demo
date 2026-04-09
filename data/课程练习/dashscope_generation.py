@@ -11,6 +11,7 @@ DashScope 文本生成（Generation）统一入口，供各课程练习脚本复
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -162,3 +163,138 @@ def chat_answer_text(response: Any) -> str:
     if not content:
         raise RuntimeError("DashScope 返回的 assistant message 无 content")
     return str(content).strip()
+
+
+def call_generation_can_search(
+    model: str,
+    messages: list[dict[str, Any]],
+    *,
+    api_key: str | None = None,
+    max_tool_turns: int = 3,
+    search_max_results: int = 5,
+    search_depth: str = "basic",
+    **kwargs: Any,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """
+    在 ``call_generation`` 的基础上增加“可联网搜索”的工具调用闭环（Function Calling 风格）。
+
+    - 不影响其它 demo：只有显式调用本函数时才启用 tools。
+    - 当前仅内置一个工具：``web_search``（使用 Tavily，见 ``web_search.search_web``）。
+
+    返回：(最终 response, 完整 messages 轨迹)。
+    """
+    from utils import generation_first_message, message_function_call
+    from web_search import search_web
+
+    tool_spec = [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "联网搜索：在互联网上检索最新/实时信息，返回结构化结果。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索查询"},
+                        "max_results": {
+                            "type": "integer",
+                            "description": "返回结果条数",
+                            "default": search_max_results,
+                        },
+                        "search_depth": {
+                            "type": "string",
+                            "description": "搜索深度：basic/advanced",
+                            "default": search_depth,
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        }
+    ]
+
+    msgs: list[dict[str, Any]] = [dict(m) for m in (messages or [])]
+    turns = 0
+    _logger.info(
+        "call_generation_can_search: start model=%r tool=web_search max_tool_turns=%d",
+        model,
+        int(max_tool_turns),
+    )
+    while True:
+        resp = call_generation(
+            model,
+            msgs,
+            api_key=api_key,
+            tools=tool_spec,
+            result_format="message",
+            **kwargs,
+        )
+        msg = generation_first_message(resp)
+        if msg is None:
+            return resp, msgs
+
+        # 记录 assistant 消息（可能带 function_call）
+        if isinstance(msg, dict):
+            msgs.append(dict(msg))
+        else:
+            # 兜底：尽量转成 dict
+            msgs.append(
+                {
+                    "role": getattr(msg, "role", "assistant"),
+                    "content": getattr(msg, "content", ""),
+                }
+            )
+
+        fc = message_function_call(msg)
+        if not fc:
+            _logger.info("call_generation_can_search: done (no tool call)")
+            return resp, msgs
+        if turns >= int(max_tool_turns):
+            raise RuntimeError("工具调用轮次超过上限，已中止（防止死循环）")
+        turns += 1
+
+        name = fc.get("name") if isinstance(fc, dict) else getattr(fc, "name", "")
+        args_raw = fc.get("arguments") if isinstance(fc, dict) else getattr(fc, "arguments", "")
+        if name != "web_search":
+            raise RuntimeError(f"不支持的 function_call: {name!r}")
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) and args_raw.strip() else {}
+        except Exception as e:
+            raise RuntimeError(f"web_search arguments 解析失败: {args_raw!r}") from e
+
+        q = str(args.get("query") or "").strip()
+        if not q:
+            tool_out = {"error": "empty_query"}
+            _logger.warning(
+                "call_generation_can_search: tool_call web_search (turn=%d) empty query",
+                turns,
+            )
+        else:
+            _logger.info(
+                "call_generation_can_search: tool_call web_search (turn=%d) query=%r max_results=%s depth=%s",
+                turns,
+                q,
+                args.get("max_results"),
+                args.get("search_depth"),
+            )
+            tool_out = search_web(
+                q,
+                max_results=int(args.get("max_results") or search_max_results),
+                search_depth=str(args.get("search_depth") or search_depth),
+            )
+            n = tool_out.get("results")
+            n2 = len(n) if isinstance(n, list) else None
+            _logger.info(
+                "call_generation_can_search: web_search ok (turn=%d) results=%s",
+                turns,
+                n2,
+            )
+
+        # 按 function_call 约定回填 function 结果
+        msgs.append(
+            {
+                "role": "function",
+                "name": "web_search",
+                "content": json.dumps(tool_out, ensure_ascii=False),
+            }
+        )
